@@ -894,3 +894,34 @@ def test_unrecognized_severity_is_not_silently_downgraded(monkeypatch, captured)
     result = healthcheck.notify_health(_healthy_conn(), 'demo', now=_NOW)
     assert result['level'] == 'warn' and result['sent']
     assert '점검 경고' in captured[0] and '확인 필요' in captured[0]
+
+def test_recovered_burst_reads_compressed_wire_and_rejects_corruption():
+    import gzip
+    from live.scenario_review_storage import MAGIC
+    conn = _recovered_input_size_conn()
+    for row in conn.execute('SELECT rowid,body FROM llm_scenario_recovery_events').fetchall():
+        conn.execute('UPDATE llm_scenario_recovery_events SET body=? WHERE rowid=?',
+                     (MAGIC + gzip.compress(row['body'].encode(), mtime=0), row['rowid']))
+    assert healthcheck._check_error_burst(conn, 'demo', _NOW) is None
+    conn.execute('UPDATE llm_scenario_recovery_events SET body=? WHERE rowid=(SELECT min(rowid) FROM llm_scenario_recovery_events)', (MAGIC+b'bad',))
+    assert healthcheck._check_error_burst(conn, 'demo', _NOW) is not None
+
+
+def test_recovered_burst_reads_references_and_fails_closed_when_source_missing():
+    from utils.btc_recovery_references import canonical, compact, pack
+
+    conn = _recovered_input_size_conn()
+    conn.execute('CREATE TABLE llm_scenario_review_events(slot INTEGER,sequence INTEGER,body TEXT,PRIMARY KEY(slot,sequence))')
+    rows = conn.execute('SELECT rowid,slot,kind,body FROM llm_scenario_recovery_events').fetchall()
+    for row in rows:
+        sequence = 0 if row['kind'] == 'MODEL_REQUEST' else 1
+        event = dict(json.loads(row['body']), kind=row['kind'], padding='x' * 3000)
+        review = json.dumps(event, sort_keys=True)
+        recovery = canonical(dict(event, calculated_review_version=1))
+        candidate = compact(review, recovery, row['slot'], sequence)
+        assert candidate != recovery
+        conn.execute('INSERT INTO llm_scenario_review_events VALUES(?,?,?)', (row['slot'], sequence, review))
+        conn.execute('UPDATE llm_scenario_recovery_events SET body=? WHERE rowid=?', (pack(candidate), row['rowid']))
+    assert healthcheck._check_error_burst(conn, 'demo', _NOW) is None
+    conn.execute('DELETE FROM llm_scenario_review_events WHERE rowid=(SELECT min(rowid) FROM llm_scenario_review_events)')
+    assert healthcheck._check_error_burst(conn, 'demo', _NOW) is not None

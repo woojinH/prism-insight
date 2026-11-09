@@ -39,8 +39,11 @@ def test_trailing_close_confirmed_but_raised_stop_runs_intraday(prompts):
     # must not tell the AI to sell on an intraday-only trailing breach.
     for key, text in prompts.items():
         assert ("장 마감 직전 자동 점검" in text) or ("pre-close automatic check" in text), key
-        # the AI sell run is before the close (KR 14:46, US 14:30 ET): it never has today's close
-        assert ("당일 종가는 아직 없습니다" in text) or ("today's close does not exist yet" in text), key
+        # 2026-10-30 user decision: the afternoon review's price counts as today's close; the morning review
+        # never sells on a trailing breach (LLY: a line from today's peak was compared with yesterday's close)
+        assert ("지금 가격을 오늘 종가로" in text) or ("treats the current price as today's close" in text), key
+        assert ("오전 판단에서는 trailing 이탈로 매도하지 마십시오" in text) or (
+            "The morning review never sells on a trailing breach" in text), key
         assert ("장중 하드스탑이 그대로 실행" in text) or ("executed by the intraday hard stop above" in text), key
         assert "trailing stop > 현재가이면 should_sell" not in text, key
         assert "If trailing stop > current price, set should_sell" not in text, key
@@ -107,6 +110,10 @@ def test_system_50_day_exit_is_named_and_reentry_is_not_a_reason(prompts):
     # Re-entry v3 only watches stop-outs, so "re-entry cost" is not a reason to hold (user decision 10/19).
     for key, text in prompts.items():
         assert ("50일선×0.995" in text) or ("50-day MA × 0.995" in text), key
+        # tools/trend_exit_seller.py ma50_exit_armed: bought below the line -> exempt until a close above it (10/29).
+        assert ("50일선 아래에서 매수한 종목은" in text) or ("bought below its 50-day MA is exempt" in text), key
+        # on_entry_session: no MA50 exit before the first close after entry (10/30 LITE).
+        assert ("매수 당일에는 어떤 종목에도" in text) or ("On the entry day itself" in text), key
         assert "재진입 비용" not in text and "re-entry cost" not in text, key
         assert ("20일 평균 이상 거래량" in text) or ("volume above its 20-day average" in text), key
 

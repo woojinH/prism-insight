@@ -11,7 +11,7 @@ from live.scenario_entry_display import project_entry_display_input
 from live.scenario_position_flow import project_position_flow_input, project_holding_price_order_input
 from live.scenario_analysis_frames import analysis_model_view, PRIMARY_FRAMES
 
-MODEL = "gpt-6.1-sol"
+MODEL = "gpt-6.1-terra"
 EFFORT = "low"
 TIMEOUT_SECONDS = 75
 MAX_RESPONSE_BYTES = 24_000
@@ -214,7 +214,16 @@ with calibrated probabilities. Never pretend confidence is a measured win rate.
 When supplied, use compression_bars separately from convergence_bars: a constant
 narrow MA gap is still compression. Use only each allowed frame's own OHLCV and
 available volume projection; retired-frame intrabar profiles are not judgment evidence.
-Volume pace is context, not an extra entry hard gate or calibrated prediction.
+For each flat-entry judgment, assess 30m and 1h volume in context of price and MA;
+when volume_4d_30m is available, compare the latest closed volume and recent
+activity against its four chronological 24-hour medians and 90th percentiles;
+latest_closed_over_median and latest_closed_over_p90 give the ratios for each day
+in the same order; overall_median_btc and latest_closed_over_overall_median use
+all 192 closed bars. Do not infer the overall median from daily medians; null means unknown.
+these percentiles describe volume distribution, not a buy/sell threshold. If unavailable, the
+four-day comparison is unknown. In an OPEN rationale, mention the relevant volume
+evidence or say it is unavailable. Volume pace is context, not an extra entry hard
+gate, directional order flow or calibrated prediction.
 A just-opened candle with zero progress/volume contains no new observation;
 it is not bearish evidence or a reason to demand confirmation. A primary candle
 with observation_kind=synthetic_boundary is a historical previous-close
@@ -231,13 +240,24 @@ and an explicit invalidation support it; do not force an entry without an edge.
 Do not use RSI, relative strength or the old alignment/strength hard gates.
 ATR is optional risk context, not an entry gate. Wait when the edge is unclear.
 Seek net-of-cost opportunities, not a quota of trades or a target win rate.
-Frame opportunities relative to the candidate direction, not whether price rises:
-a favorable LONG or favorable SHORT deserves the same opportunity-cost review.
-For either direction with supported primary-frame evidence, compare acting now
-with missing the move, without FOMO, forced chasing or fabricated probability.
-When evidence is adverse to the held/candidate direction, prioritize loss control;
-when mixed, compare smaller risk-scaled exposure with WAIT. Opportunity cost
-never overrides execution safety, original risk limits or genuine invalidation.
+Frame each candidate relative to its direction and original purpose:
+- Supported trend continuation (LONG or SHORT): weigh missing the move against
+  executable location, structural invalidation and remaining room. Preserve grounded
+  later participation; direction alone does not justify chasing or distant targets.
+- Bounded MA traversal: prioritize reachable room before the original boundary
+  and costs. BETWEEN is a location, not proof of a range or a traversal purpose.
+- Emerging direction or mixed primary frames: weigh actual 30m progress and volume
+  against 1h contraction/conflict. One narrowing frame calls for more conservative
+  evidence review, not a new automatic veto. A widening gap alone is not momentum.
+- Weak participation or directionless price: prioritize capital and round-trip
+  costs without inventing a trade. Low total volume alone is not a universal ban.
+For an active position, compare changes with the original thesis and prior observed
+progress: slow but thesis-preserving flow does not require reduction merely because
+of elapsed time; fast adverse evidence or confirmed failure calls for risk control.
+Slow flow never excuses holding an invalidated thesis. Normal noise is not failure.
+These frames guide discretion only: host gates, original goal, protection and risk
+limits retain priority. Higher-frame alignment is context, not unanimous permission.
+Confidence is not measured win probability. Smaller size does not repair a weak setup.
 Leverage is FIXED 10, not confidence-dependent. Allocate less quantity to weaker
 evidence. Set the structural invalidation first, then size down for the host
 risk cap including costs; recovery reduces quantity, not automatically the
@@ -584,11 +604,15 @@ In calculated review, use host-calculated candidate economics; do not discard
 a structurally justified candidate solely on an estimated-cost impression before
 that calculation. The host still enforces economic and safety limits. Keep SL at structural
 invalidation with noise room, not artificially tight to manufacture reward/risk.
-Contraction alone is not a veto. Fresh directional price progress or a supported
+A single narrowing timeframe alone is not a veto; host entry restrictions always apply. Fresh directional price progress or a supported
 breakout/retest can justify entry while the old MA gap still narrows, before a
 lagging crossover. Do not require another MA10 cross, a candle close or unanimous
 30m/1h alignment. Compare confirmed and forming evidence separately: forming
 progress is provisional, and a tiny WIDENING sign alone is not strong expansion.
+When forming_last_vs_confirmed_ma10_atr is available, it is signed forming Last
+close minus confirmed MA10 divided by confirmed ATR. Use it as optional distance
+context alongside nearby objectives, compression and follow-through; it is not a
+probability, entry veto or proof that a move is exhausted. Last is not Mark.
 For a decisive gap claim, name the timeframe and confirmed/forming phase and use
 the supplied ma_structure.primary[frame].confirmed_gap.state or forming_gap.state,
 or that frame's matching timestamped transitions.gap_state/gap_change_price.
@@ -626,8 +650,9 @@ No candidate or first observation: do not invent a plan to compare. Distinguish 
 progress from remaining room using current evidence, not direction alone. Smaller quantity or a nearer
 TP does not repair an unsupported location. If current evidence justifies entry, a strong
 immediate break or valid numeric crossing remains allowed; do not demand another close,
-new low/high or retest by habit. No fixed distance, minimum reward/risk, or automatic
-MA/round-number wall is added. Neither immediate entry nor conditional entry is compulsory.
+new low/high or retest by habit. Supplied host entry_economics governs fresh OPEN eligibility; without it no fixed
+reward/risk floor is implied. No fixed price distance or automatic MA/round-number
+wall is added. Neither immediate entry nor conditional entry is compulsory.
 Existing sizing cap: sum(new-entry risk) <= min(original_budget*confidence,
 budget remaining after consumed/reserved risk). Per-BTC risk is positive entry-to-SL
 distance + entry*estimated_cost_rate + hard_stop*slippage_bps/10000; round quantity
@@ -646,6 +671,17 @@ fabricated reward/risk or probabilities; summarize the choice in existing ration
 MA_STRUCTURE_PROMPT = """
 MA structure review applies to flat, pending and holding contexts; all earlier
 host safety, accounting, lifecycle and protection restrictions retain priority.
+When either 1h or 30m gap narrows, treat it as a caution for new entry or add.
+Compare each frame's absolute gap and compression history, not just its latest
+gap change: one widening bar can still leave MAs tightly compressed. Price above
+the MAs alone does not confirm upward momentum, nor does price below confirm
+downward momentum. For a narrow band, assess whether remaining directional room
+and evidence justify entry after costs; otherwise prefer WAIT.
+Distinguish confirmed from provisional narrowing and compare the actual directional
+progress, nearby obstacles and invalidation with WAIT or a justified conditional
+entry. Subject to host restrictions, narrowing alone is not an automatic veto,
+including 1h narrowing with 30m expansion when price progress supports it.
+Existing position protection and exits are unchanged.
 Use ma_structure.primary own-time close/MA points and numeric transitions, not current
 MAs projected onto older candles. Read close_vs_ma10/close_vs_ma35 as that point's
 own-time CLOSE relative to each MA, not the LEVEL relative to current Mark.
@@ -708,13 +744,13 @@ a nearer actual obstacle; do not justify economic edge or a distant runner by
 assuming continuation beyond MA35. This bounded-purpose rule takes precedence
 over generic runner/allocation defaults for this setup only, without imposing an
 exact MA35 TP, fixed allocation or automatic touch exit.
-When opening this evidenced local MA10-boundary breakout with entry_contract_version=1,
-use existing BREAKOUT regime, not a new enum or a claim of full trend reversal.
-In its premise and expected_progress name the bounded gap-traversal purpose and
-relevant timeframe; band position alone does not establish it. Keep that contract's
-explicit_failure as the only authoritative numeric failure rule, with no duplicate
-prose threshold. Without version 1, describe the purpose in existing rationale only;
-never emit unsupported contract fields.
+For evidenced MA10-boundary breakout, use existing BREAKOUT regime when
+entry_contract_version is 1 or 2; band position alone is insufficient. With version 1,
+name the bounded purpose and timeframe in premise and expected_progress. With version 2,
+name them in premise and the required structured goal. Without an enabled contract,
+describe the purpose in rationale only; never emit unsupported fields. For both versions,
+explicit_failure is the only authoritative numeric failure rule; no duplicate threshold
+or claim of full trend reversal.
 For an original gap-traversal holding, do not silently turn MA35 arrival/rejection
 or failed progress into a new full-reversal or trend-resumption thesis. Unlike a
 trend runner, do not assume extension beyond MA35: assess existing TP, verified
@@ -1088,17 +1124,17 @@ def propose(snapshot: dict, context: dict, response_contract: dict, *,
     system_prompt = immediate_reduce_instructions(system_prompt, context)
     from live.scenario_recovery import record_model_request, record_model_wire, record_model_error
     record_model_request(system_prompt=system_prompt, user_prompt=prompt,
-                         response_schema=schema, model=MODEL, effort=EFFORT, fast=True,
+                         response_schema=schema, model=MODEL, effort=EFFORT, fast=False,
                          input_projection=projection_audit)
     try:
         result = generate(system_prompt=system_prompt, user_prompt=prompt,
-                          model=MODEL, reasoning_effort=EFFORT, fast_tier=True,
+                          model=MODEL, reasoning_effort=EFFORT, fast_tier=False,
                           timeout=TIMEOUT_SECONDS, mcp_profile=None,
                           response_schema=schema)
     except Exception:
         record_model_error("oauth_model_failed")
         raise ScenarioModelError("oauth_model_failed") from None
-    record_model_wire(result.text, model=MODEL, effort=EFFORT, fast=True)
+    record_model_wire(result.text, model=MODEL, effort=EFFORT, fast=False)
     if not 0 <= clock() - started <= TIMEOUT_SECONDS:
         record_model_error("late_response")
         raise ScenarioModelError("late_response")

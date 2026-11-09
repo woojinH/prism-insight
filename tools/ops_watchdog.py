@@ -14,6 +14,11 @@ The same problem is held back for REPEAT_HOURS and then re-sent with its count. 
 runs again sends [복구]. Once a day (SUMMARY_AT, KST) a summary shows what ran, which also proves the
 watchdog itself is alive: no summary in the morning means the watchdog is down.
 
+Since 2026-11-07 (user decision) the chat gets only [장애]/[복구] and the disk alert by default: the daily
+summary and [주의]-only messages read like bug hunting and were replaced by the biweekly review
+(tools/two_week_review.py --every 14), which also reports when the watchdog last ran. Turn them back on with
+OPS_WATCHDOG_SUMMARY_ENABLED=true / OPS_WATCHDOG_NOTICES_ENABLED=true.
+
 Jobs that run under systemd (the B3 worker, which also runs the LIVE micro-split adds) log to journald;
 they are read with journalctl after a stored cursor. Without journalctl (CI, macOS) or a readable journal
 such a job is skipped for that run: no failure scan and no stopped-job alert.
@@ -28,6 +33,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess  # nosec B404 - fixed journalctl argv, no shell
 import sys
 from dataclasses import dataclass
@@ -48,6 +54,7 @@ SUMMARY_AT = os.getenv("OPS_WATCHDOG_SUMMARY_AT", "08:30")      # KST
 MAX_READ_BYTES = 50 * 1024 * 1024
 EXAMPLES_PER_GROUP = 3
 MESSAGE_LIMIT = 3400
+DISK_ALERT_PCT = float(os.getenv("OPS_WATCHDOG_DISK_ALERT_PCT", "90"))
 JOURNAL_MAX_ENTRIES = 5000             # per unit and run (oldest first); the rest is read on the next run
 JOURNAL_TIMEOUT_S = 30
 B3_CONTRACT = '"contract": "b3-ae-worker-v1"'   # the B3 worker's tick line (printed every minute, all day)
@@ -112,9 +119,10 @@ FAILURES = (
     (re.compile(r" - ERROR - "), "오류 기록", "주의"),
 )
 # Known non-failures: yfinance's delisted/unknown-symbol notices (a peer candidate Yahoo lacks is dropped, LC 10/27),
-# the local OAuth proxy's timeout the OpenAI client retries (10/27), and skips we chose (one share over budget, 10/16).
+# the local OAuth proxy's timeout the OpenAI client retries (10/27), and skips we chose (one share over budget, 10/16;
+# its later sell finds no shares in the account, LLY 10/30).
 IGNORED = re.compile(r"possibly delisted|Quote not found for symbol|aiohttp\.server - ERROR - Error handling request"
-                     r"|below one share|quantity is 0|budget unavailable")
+                     r"|below one share|quantity is 0|not found in portfolio|budget unavailable")
 _EXCEPTION_LINE = re.compile(r"^[A-Za-z_][\w.]*(Error|Exception|Interrupt|Exit|Timeout)\b")
 _MARKET_TAG = re.compile(r"\[(KR|US)\]|\((KR|US)\)|market=(KR|US)\b|\b(KR|US) (summary|trading context)")
 # Broker client lines carry no market tag; their logger names it (a shared log's owner is the KR job, 2026-10-24).
@@ -507,13 +515,19 @@ def run(now_kst=None, *, state_path=STATE_PATH, sender=None, dry_run=False, jobs
         sent.pop(sig)
 
     messages = []
+    disk = disk_alert(state, now_kst)
+    if disk:
+        messages.append(disk)
+    if not _flag("OPS_WATCHDOG_NOTICES_ENABLED", False):
+        to_send = [item for item in to_send if item[0]["severity"] == "장애"]
     alert = build_alert(to_send, stale_new, recovered, now_kst, jobs)
     if alert:
         messages.append(alert)
     hour, minute = _hm(SUMMARY_AT)
     due = now_kst.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if now_kst >= due and state.get("summary_day") != now_kst.date().isoformat() and not first_run:
-        messages.append(build_summary(state, now_kst, jobs))
+        if _flag("OPS_WATCHDOG_SUMMARY_ENABLED", False):
+            messages.append(build_summary(state, now_kst, jobs))
         state["summary_day"] = now_kst.date().isoformat()
         state["summary_since"] = now_kst.isoformat()
         state["tally"] = {}
@@ -532,6 +546,29 @@ def run(now_kst=None, *, state_path=STATE_PATH, sender=None, dry_run=False, jobs
     return messages
 
 
+def disk_used_pct():
+    usage = shutil.disk_usage(ROOT)
+    # Same as df Use%: root's reserved blocks are not free space for the jobs (83% here when total said 80%).
+    return 100 * usage.used / (usage.used + usage.free)
+
+
+def disk_alert(state, now_kst):
+    """A full disk stopped Codex and MCP startups for a day (db-server, 2026-10-28): warn before that."""
+    pct = disk_used_pct()
+    last = state.get("disk_alert")
+    if pct < DISK_ALERT_PCT:
+        state.pop("disk_alert", None)
+        return None
+    if last and now_kst - datetime.fromisoformat(last) < timedelta(hours=REPEAT_HOURS):
+        return None
+    state["disk_alert"] = now_kst.isoformat()
+    free_gb = shutil.disk_usage(ROOT).free / 1e9
+    return (f"[장애] PRISM 서버 저장공간 부족 {now_kst:%m/%d %H:%M} KST\n"
+            f"■ 디스크 {pct:.0f}% 사용 (남은 공간 {free_gb:.1f}GB, 기준 {DISK_ALERT_PCT:g}%)\n"
+            f"  가득 차면 AI 판단·뉴스 검색이 시작되지 않습니다. 큰 파일: du -xh --max-depth=1 / | sort -rh | head\n"
+            f"{REPEAT_HOURS:g}시간 뒤에도 기준 이상이면 다시 보냅니다.")
+
+
 def _source(job):
     """Where a job's lines come from: its log file or its systemd unit's journal."""
     return f"journal:{job.unit}" if job.unit else job.log
@@ -547,8 +584,15 @@ def _send(text):
     return send_ops_alert_sync(text)
 
 
+def _flag(name, default):
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def enabled():
-    return os.getenv("OPS_WATCHDOG_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+    return _flag("OPS_WATCHDOG_ENABLED", True)
 
 
 def main(argv=None):

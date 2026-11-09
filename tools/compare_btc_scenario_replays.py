@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import sqlite3
+import sys
 from collections import Counter
 from decimal import Decimal
 from datetime import datetime
@@ -46,7 +47,7 @@ def verify_registry_contract(contract, registry):
     equal(contract["initial_equity"], registry["initial_equity"], "registry_equity_mismatch")
     require(contract["model"] == registry["model"] and contract["effort"] == registry["reasoning"],
             "registry_model_mismatch")
-    require(registry["service_tier"] == "priority" and contract["tier"] == "fast",
+    require((registry["service_tier"], contract["tier"]) in {("priority", "fast"), ("default", "default")},
             "registry_service_tier_mismatch")
     require(registry["source_pin_reference"] == registry["source_reference"], "source_pin_reference_mismatch")
     require(contract["data_hash"] == registry["expected_data_hash"], "registry_data_mismatch")
@@ -250,9 +251,15 @@ def verify_economic_rejections(directory, report):
     if report["contract"].get("policy_profile") not in profiles:
         require("economic_rejections" not in report, "unexpected_rejection_protocol")
         return
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from observability.review_storage import review_text
     with sqlite3.connect((directory / "replay.sqlite").resolve().as_uri() + "?mode=ro", uri=True) as conn:
-        events = [(slot, json.loads(body)) for slot, body in conn.execute(
-            "SELECT slot,body FROM llm_scenario_review_events ORDER BY slot,sequence")]
+        from utils.btc_review_event_references import read_event
+        events = [(slot, json.loads(read_event(body, conn, slot, sequence, decode_legacy=review_text)))
+                  for slot, sequence, body in conn.execute(
+            "SELECT slot,sequence,body FROM llm_scenario_review_events ORDER BY slot,sequence")]
         decisions = {slot: (proposal, context) for slot, proposal, context in conn.execute(
             "SELECT slot,proposal,context FROM llm_scenario_decisions")}
         intent_inputs = {json.loads(payload)["input_id"] for (payload,) in conn.execute(

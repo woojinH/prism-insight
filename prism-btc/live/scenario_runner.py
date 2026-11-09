@@ -177,6 +177,8 @@ def record_health(conn,result,*,snapshot=None,loop=None,clock=time.time):
         if result.get("error_type") in _ERROR_TYPES:
             detail+="; error_type="+result["error_type"]
         tracking.log_event(conn,"error",detail,level="error",mode="demo")
+    if status == "intent_pending" and result.get("reason") == "submission_unknown":
+        tracking.log_event(conn, "error", "scenario tick: submission_unknown", level="error", mode="demo")
     tracking.log_event(conn,"heartbeat","scenario tick: "+status,mode="demo")
 
 
@@ -283,7 +285,8 @@ def main():
         failure_stage="broker_init"
         from live.scenario_broker import ScenarioDemoBroker
         broker=ScenarioDemoBroker(conn,expected_main_uid=main_uid,execution_enabled=True,
-                                  convergence_entry_enabled=True)
+                                  convergence_entry_enabled=True,
+                                  entry_economics_enabled=args.calculated_review)
         if args.activate:
             failure_stage="activation"
             from live.scenario_control import begin_transition,activate,flat_handoff_probe

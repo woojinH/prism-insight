@@ -8,6 +8,7 @@ fills, like the legacy full-slot entry. OFF unless MICRO_SPLIT_LIVE_ENABLED.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from copy import deepcopy
@@ -23,6 +24,101 @@ def live_enabled(market):
     flag = os.getenv("MICRO_SPLIT_LIVE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
     markets = {m.strip().upper() for m in os.getenv("MICRO_SPLIT_LIVE_MARKETS", "KR,US").split(",") if m.strip()}
     return flag and str(market).upper() in markets
+
+
+def pyramid_rows_enabled():
+    """#288 pyramid rows for micro-split holdings (user decision 2026-11-08), default off.
+
+    On: a held micro-split winner may open another independent row (max 3) that is itself a
+    micro-split position. Off: micro-split rows stay out of #288 (LEGACY_PYRAMID_BLOCKED_MICRO_SPLIT).
+    """
+    return os.getenv("PYRAMID_ROWS_MICRO_SPLIT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+PYRAMID_RESERVE_DEFAULT = 2        # free rows kept for new names (user decision 2026-11-08, after replay)
+PYRAMID_RESERVE_BELOW_DEFAULT = 8  # the reserve applies only below this many distinct tickers
+_ACCOUNT_TICKERS_SQL = {"KR": "SELECT ticker FROM stock_holdings WHERE account_key = ?",
+                        "US": "SELECT ticker FROM us_stock_holdings WHERE account_key = ?"}
+
+
+def _own_cursor(agent):
+    """A separate cursor, so a read here never resets the caller's shared cursor results."""
+    conn = getattr(agent, "conn", None)
+    return conn.cursor() if conn is not None else agent.cursor
+
+
+def _setting(name, default):
+    value = int(os.getenv(name, str(default)).strip())
+    if value < 0:
+        raise ValueError(name)
+    return value
+
+
+def pyramid_reserve_check(row_tickers, max_slots):
+    """(ok, reason) for opening one more pyramid row, counted in holding ROWS like the MAX_SLOTS
+    new-entry limit. free_after = max_slots - (rows + 1). While the account holds fewer than
+    PYRAMID_RESERVE_BELOW_TICKERS (default 8) distinct tickers, free_after must stay >=
+    PYRAMID_RESERVE_SLOTS (default 2); at or above it the reserve is 0. MAX_SLOTS always holds.
+    Unreadable settings or holdings fail closed. New-name entries never call this.
+    The weighted-slot AI cap stays a separate check in the buy path."""
+    try:
+        reserve = _setting("PYRAMID_RESERVE_SLOTS", PYRAMID_RESERVE_DEFAULT)
+        below = _setting("PYRAMID_RESERVE_BELOW_TICKERS", PYRAMID_RESERVE_BELOW_DEFAULT)
+        tickers = list(row_tickers)
+        free_after = int(max_slots) - (len(tickers) + 1)
+    except (TypeError, ValueError):
+        return False, "PYRAMID_RESERVE_SLOTS:UNKNOWN"
+    names = len({str(t) for t in tickers})
+    required = reserve if names < below else 0
+    if free_after < 0:
+        return False, f"PYRAMID_MAX_SLOTS:rows={len(tickers)}/{max_slots}"
+    if free_after < required:
+        return False, f"PYRAMID_RESERVE_SLOTS:free_after={free_after}<{required} (tickers={names}<{below})"
+    return True, f"PYRAMID_RESERVE_SLOTS_OK:free_after={free_after}>={required} (tickers={names})"
+
+
+def pyramid_slot_check(agent, *, market, ticker, logger=None):
+    """Reserve rule for the active account, run BEFORE sizing (no add plan for a blocked row): (ok, reason)."""
+    try:
+        rows = _own_cursor(agent).execute(_ACCOUNT_TICKERS_SQL[str(market).upper()],
+                                          (agent._account_scope()[0],)).fetchall()
+        ok, reason = pyramid_reserve_check([row[0] for row in rows], agent.max_slots)
+    except Exception:  # noqa: BLE001 - unknown usage fails closed
+        ok, reason = False, "PYRAMID_RESERVE_SLOTS:UNKNOWN"
+    if logger:
+        logger.warning("[PYRAMID_ROW][%s] %s %s: %s", market, ticker, "slot ok" if ok else "blocked", reason)
+    return ok, reason
+
+
+def pyramid_row_check(agent, *, market, ticker, plan, logger=None):
+    """Flag-on pyramid row admission: (ok, reason). The row must be micro-split (a B3 plan was
+    built) and pass the reserve rule for the active account."""
+    if plan is None:
+        if logger:
+            logger.warning("[PYRAMID_ROW][%s] %s blocked: PYRAMID_ROW_NO_MICRO_PLAN", market, ticker)
+        return False, "PYRAMID_ROW_NO_MICRO_PLAN"
+    return pyramid_slot_check(agent, market=market, ticker=ticker, logger=logger)
+
+
+def rows_cost_weighted_entry(rows):
+    """Cost-weighted entry of a ticker's rows [(buy_price, scenario)], or None when a row is unreadable.
+
+    A micro-split row weighs its slot allocation at its leg-weighted entry (its ``buy_price`` is
+    only the first leg); a legacy row weighs one slot at ``buy_price``. Slot weights equal cost
+    weights because rows of one account share that account's slot amount.
+    """
+    cost = units = Decimal(0)
+    for buy_price, scenario in rows:
+        if isinstance(scenario, str):
+            scenario = json.loads(scenario or "{}")
+        block = record(scenario)
+        if block is not None:
+            weight, entry = _dec(block["allocation"]), weighted_entry(block["legs"])
+        else:
+            weight, entry = Decimal(str(slot_fraction(scenario))), _dec(buy_price)
+        cost += weight
+        units += weight / entry
+    return float(cost / units) if units > 0 else None
 
 
 def plan_adds_enabled(market):
@@ -98,19 +194,96 @@ def conviction_tilt(base, *, market, buy_score, trigger_type):
             "buy_score": float(score), "trigger_type": str(trigger_type).strip()}
 
 
-def entry_record(*, plan, unit_amount, market, entered_at, tilt=None):
+# Re-entry first size (2026-11-08, user decision after H-1106-reentry-shrink): a LIVE re-entry starts
+# at REENTRY_V3_FIRST_SIZE_FACTOR x the B3 initial; adds still come from the add_plan rails.
+REENTRY_SIZE_REASON = "REENTRY_FIRST_SIZE"
+# H-1109 LIVE (2026-11-09, user decision): a re-entry in a bull regime keeps the full B3 initial (KR and US);
+# sideways, bear and MISSING regimes keep the REENTRY_V3_FIRST_SIZE_FACTOR size.
+REENTRY_BULL_SIZE_REASON = "REENTRY_BULL_FULL_SIZE"
+
+
+def reentry_first_size(base, scenario):
+    """{"base", "sized", "factor", "reason"} for a re-entry scenario when the factor is below 1, else None.
+
+    With REENTRY_V3_BULL_FULL_SIZE on, a bull-regime re-entry records factor 1 (the full B3 initial).
+    """
+    meta = (scenario or {}).get("reentry") if isinstance(scenario, dict) else None
+    if not isinstance(meta, dict) or not meta.get("version"):
+        return None
+    regime = scenario.get("_deterministic_market_regime")
+    if (os.getenv("REENTRY_V3_BULL_FULL_SIZE", "false").strip().lower() in {"1", "true", "yes", "on"}
+            and regime in _BULL):
+        base = _dec(base)
+        return {"base": str(base), "sized": str(base), "factor": "1", "reason": REENTRY_BULL_SIZE_REASON,
+                "regime": regime}
+    try:
+        factor = Decimal(os.getenv("REENTRY_V3_FIRST_SIZE_FACTOR", "1").strip())
+    except ArithmeticError:
+        return None
+    if not factor.is_finite() or not 0 < factor < 1:
+        return None
+    base = _dec(base)
+    sized = (base * factor).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    return {"base": str(base), "sized": str(_dec(sized)), "factor": str(factor), "reason": REENTRY_SIZE_REASON}
+
+
+# H-1109-kr-reentry-bull-size SHADOW (2026-11-09, user approval): record what the first re-entry size
+# would be under regime sizing (bull 1.0; sideways/bear 0 or 0.5). Observation only, never the order.
+REGIME_SHADOW_ID = "H-1109-reentry-regime-size"
+_BULL = {"parabolic", "strong_bull", "moderate_bull"}
+_BEAR = {"moderate_bear", "strong_bear"}
+REGIME_SHADOW_ARMS = {"bull1_else0": {"bull": "1", "sideways": "0", "bear": "0"},
+                      "bull1_else05": {"bull": "1", "sideways": "0.5", "bear": "0.5"}}
+
+
+def regime_size_shadow(base, scenario, reentry_size=None):
+    """Hypothetical first re-entry sizes per regime arm, or None when off or not a re-entry.
+
+    A missing or unknown regime stays MISSING (no arm sizes), never a default bucket.
+    """
+    if os.getenv("REENTRY_REGIME_SIZE_SHADOW", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    meta = (scenario or {}).get("reentry") if isinstance(scenario, dict) else None
+    if not isinstance(meta, dict) or not meta.get("version"):
+        return None
+    regime = scenario.get("_deterministic_market_regime")
+    bucket = ("bull" if regime in _BULL else "bear" if regime in _BEAR else "sideways" if regime == "sideways"
+              else None)
+    base = _dec(base)
+    out = {"id": REGIME_SHADOW_ID, "regime": regime, "bucket": bucket or "MISSING", "base": str(base),
+           "applied_factor": (reentry_size or {}).get("factor", "1"),
+           "applied": (reentry_size or {}).get("sized", str(base))}
+    if bucket:
+        out["arms"] = {name: {"factor": f[bucket],
+                              "sized": str((base * Decimal(f[bucket])).quantize(Decimal("0.0001"), rounding=ROUND_DOWN).normalize())}
+                       for name, f in REGIME_SHADOW_ARMS.items()}
+    return out
+
+
+def _safe_regime_shadow(base, scenario, reentry_size):
+    try:
+        return regime_size_shadow(base, scenario, reentry_size)
+    except Exception:  # noqa: BLE001 - the shadow record must never change the live entry
+        return None
+
+
+def entry_record(*, plan, unit_amount, market, entered_at, tilt=None, reentry_size=None, regime_shadow=None):
     """The micro_split block stored on the new holding's scenario.
 
     With a conviction ``tilt`` the first leg and the allocation are the tilted value and the
     tilt is recorded next to the B3 plan hash (which still describes the base initial).
     """
-    initial = tilt["tilted"] if tilt else plan["initial_nominal"]
+    initial = tilt["tilted"] if tilt else (reentry_size["sized"] if reentry_size else plan["initial_nominal"])
     block = {"contract": CONTRACT, "policy_version": plan["policy_version"], "plan_hash": plan["plan_hash"],
              "market": str(market).upper(), "unit_amount": str(_dec(unit_amount)), "allocation": str(_dec(initial)),
              "legs": [{"kind": "INITIAL", "allocation": str(_dec(initial)),
                        "price": str(_dec(plan["entry_reference"])), "at": entered_at}]}
     if tilt:
         block["conviction_tilt"] = dict(tilt)
+    if reentry_size:
+        block["reentry_size"] = dict(reentry_size)
+    if regime_shadow:
+        block["reentry_regime_shadow"] = dict(regime_shadow)
     # Why the first size is what it is (observation only; the plan hash above freezes the same values).
     setup = plan.get("setup") or {}
     block["sizing"] = {k: (str(v) if v is not None else None) for k, v in (
@@ -175,15 +348,20 @@ def display(scenario):
 
 
 def prepare_entry(agent, *, market, ticker, current_price, scenario, decision_ref, account, logger=None,
-                  trigger_type=None):
+                  trigger_type=None, pyramid_row=None):
     """Size a LIVE first entry: (plan, cash_amount, scenario_with_record) or (None, None, scenario).
 
     Called with the refreshed execution price, before the strategy row and the
     broker order. When LIVE is off or the plan cannot be built (no ATR/stop),
     the legacy full-slot entry is unchanged and the reason is logged. A top setup
     (scenario buy_score >= 8 and a strong ``trigger_type``) starts with the conviction
-    tilt; callers pass no trigger type for entries outside the regular batch (re-entry).
+    tilt; callers pass no trigger type for entries outside the regular batch (re-entry,
+    pyramid rows). ``pyramid_row`` (prism_core.pyramid_ledger.lineage: entry_no 2/3, parent rows and
+    traces) marks a #288 pyramid row on the block.
     """
+    if pyramid_row:
+        # A pyramid row is a plain first entry linked by origin/parent traces: never re-entry sizing.
+        scenario = {k: v for k, v in scenario.items() if k != "reentry"}
     if not live_enabled(market):
         return None, None, scenario
     try:
@@ -193,11 +371,16 @@ def prepare_entry(agent, *, market, ticker, current_price, scenario, decision_re
                           stop_loss=scenario.get("stop_loss"), decision_ref=decision_ref)
         tilt = conviction_tilt(plan["initial_nominal"], market=market, buy_score=scenario.get("buy_score"),
                                trigger_type=trigger_type)
-        initial = tilt["tilted"] if tilt else plan["initial_nominal"]
+        size = None if tilt else reentry_first_size(plan["initial_nominal"], scenario)
+        initial = tilt["tilted"] if tilt else (size["sized"] if size else plan["initial_nominal"])
         cash = scaled_cash(unit, initial, market)
         updated = dict(scenario)
         updated[SCENARIO_KEY] = entry_record(plan=plan, unit_amount=unit, market=market,
-                                             entered_at=plan["created_at"], tilt=tilt)
+                                             entered_at=plan["created_at"], tilt=tilt, reentry_size=size,
+                                             regime_shadow=None if tilt else _safe_regime_shadow(
+                                                 plan["initial_nominal"], scenario, size))
+        if pyramid_row:
+            updated[SCENARIO_KEY]["pyramid_row"] = dict(pyramid_row)
         attach_buy_add_plan(updated, market=market, ticker=ticker, raw=updated.pop("add_plan", None), logger=logger)
         if logger:
             logger.warning("[MICRO_SPLIT][%s] %s initial=%s b3_initial=%s tilt=%s cash=%s", market, ticker, initial,
@@ -252,10 +435,22 @@ def _emit_planned(*, market, ticker, position_id, block, plan, issues, decision_
                                "plan_source": (plan or {}).get("source"), "valid_for": (plan or {}).get("valid_for"),
                                "scenario_ids": [s["id"] for s in scenarios],
                                "lens": sorted({x for s in scenarios for x in s["lens"]}),
-                               "dropped": [i["reason"] for i in issues]})
+                               "dropped": [i["reason"] for i in issues],
+                               # Trigger levels and chase limits, so a blocked or missed add can be replayed
+                               # after the holding row's plan history (last few sessions) is overwritten.
+                               "scenarios": [{k: s.get(k) for k in ("id", "type", "trigger", "target_allocation",
+                                                                    "max_chase_pct", "max_chase_pct_written")}
+                                             for s in scenarios]})
     except Exception as error:  # noqa: BLE001 - observability never affects trading
         import logging
         logging.getLogger(__name__).warning("[MICRO_SPLIT][%s] add_planned event skipped: %s", market, error)
+
+
+def pyramid_signal_fields(scenario):
+    """Extra BUY signal fields for a micro-split pyramid row ({} otherwise); sizing stays position_fraction."""
+    block = record(scenario)
+    row = block.get("pyramid_row") if block is not None else None
+    return {"entry_kind": "PYRAMID_ADD", "pyramid_entry_no": row.get("entry_no")} if isinstance(row, dict) else {}
 
 
 def entry_message_block(scenario, market):
@@ -269,6 +464,8 @@ def entry_message_block(scenario, market):
     tilt = block.get("conviction_tilt") or {}
     base = round(float(tilt["base"]) * 100) if tilt.get("base") else None
     tilted = f" (상위 셋업 가중, 기본 {base}%에서 상향)" if base is not None else ""
+    if (block.get("reentry_size") or {}).get("reason") == REENTRY_SIZE_REASON:
+        tilted = f" (재진입 첫 비중 축소, 기본 {round(float(block['reentry_size']['base']) * 100)}%에서 하향)"
     plan = block.get("add_plan") or {}
     labels = [add_plan.scenario_label(s, market, "ko") for s in plan.get("scenarios") or []]
     if not plan_adds_enabled(market):
@@ -417,6 +614,37 @@ _SCENARIO_SQL = {
 }
 
 
+def record_order_price(agent, *, market, row_id, price, logger=None):
+    """Store the price that sized the first leg's broker order (``legs[0].order_price``).
+
+    The US path re-quotes at the broker after the strategy row is written, so the order can be
+    sized at another price than the leg; per-row exit quantities (prism_core.loop_row_split) use
+    it. Legacy rows and an unreadable row are left alone. Never raises (observation of the order).
+    """
+    conn = None
+    try:
+        market, price, conn = str(market).upper(), _dec(price), agent.conn
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")  # same guard as a worker add: no lost leg
+        row = conn.execute(_SCENARIO_SQL[market], (int(row_id),)).fetchone()
+        scenario = json.loads(row[0]) if row and row[0] else None
+        block = record(scenario)
+        if block is None or block["legs"][0].get("order_price") == str(price):
+            conn.rollback()
+            return False
+        block["legs"][0]["order_price"] = str(price)
+        conn.execute(_UPDATE_SQL[market], (json.dumps(scenario, ensure_ascii=False), int(row_id)))
+        conn.commit()
+        return True
+    except Exception as error:  # noqa: BLE001 - the leg price stays the sizing basis
+        if conn is not None:
+            with contextlib.suppress(Exception):  # a failed rollback must not hide the original error
+                conn.rollback()
+        if logger:
+            logger.warning("[MICRO_SPLIT][%s] order price not recorded for row %s: %s", market, row_id, error)
+        return False
+
+
 def add_order_status(result, market):
     """Plain order status for the add message (reason codes stay in logs and the add_executed event)."""
     if result.get("success"):
@@ -464,6 +692,23 @@ def add_signal_fields(*, market, campaign, meta, before, after, price, stop_loss
             "stop_loss": float(stop_loss) if stop_loss else None, "scenario_type": meta.get("scenario_type"),
             "acceleration": meta.get("rail") == "ACCELERATION", "trade_success": bool(result.get("success")),
             "trade_message": str(result.get("message") or "")[:200]}
+
+
+def ticker_signal_fields(agent, *, market, symbol, account_key, row_id, before, after):
+    """ticker_allocation_before/after and ticker_rows of an ADD ({} when the rows are unreadable).
+
+    Why (2026-11-08): with pyramid rows a subscriber sees only the broker's ticker total, so a row's
+    own allocation_after looked already filled and every pyramid-row add was skipped there.
+    """
+    from prism_core.loop_row_split import _ROWS_SQL
+    try:
+        rows = _own_cursor(agent).execute(_ROWS_SQL[market], (symbol, account_key)).fetchall()
+        others = sum(slot_fraction(json.loads(r[1] or "{}")) for r in rows if int(r[0]) != int(row_id))
+        count = len(rows) if any(int(r[0]) == int(row_id) for r in rows) else len(rows) + 1
+    except Exception:  # noqa: BLE001 - unknown stays absent; subscribers fall back to the row
+        return {}
+    return {"ticker_allocation_before": round(others + float(before), 4),
+            "ticker_allocation_after": round(others + float(after), 4), "ticker_rows": count}
 
 
 async def publish_add_signal(*, ticker, company_name, price, fields):
@@ -582,6 +827,9 @@ async def execute_add(agent, *, market, campaign, decision, now, chat_id=None):
             fields = add_signal_fields(market=market, campaign=campaign, meta=meta, before=before, after=after,
                                        price=price, stop_loss=row.get("stop_loss"), result=result,
                                        signal_id=intent.source_decision_id)
+            fields.update(ticker_signal_fields(agent, market=market, symbol=campaign["symbol"],
+                                               account_key=campaign["account_key"], row_id=row_id,
+                                               before=before, after=after))
         except (KeyError, TypeError, ValueError) as error:
             import logging
             logging.getLogger(__name__).warning("[MICRO_SPLIT][%s] add signal skipped: %s", market, error)
@@ -722,6 +970,8 @@ def dashboard_fields(scenario, *, buy_price=None, current_price=None):
     fields = {"allocation": fraction, "allocation_label": display(scenario) or (
         f"비중 {round(fraction * 100)}%" if fraction < 1 else None), "average_entry": entry,
         "add_count": max(len(block["legs"]) - 1, 0) if block is not None else 0}
+    if block is not None and isinstance(block.get("pyramid_row"), dict):
+        fields["pyramid_entry_no"] = block["pyramid_row"].get("entry_no")
     if current_price and entry:
         fields["slot_profit_rate"] = (float(current_price) / float(entry) - 1) * 100 * fraction
     return fields

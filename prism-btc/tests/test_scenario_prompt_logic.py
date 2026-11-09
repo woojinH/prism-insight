@@ -15,11 +15,11 @@ from live.scenario_analysis_frames import analysis_model_view
 def test_user_approved_flexible_management_prompt_version_is_pinned():
     import hashlib
     from live.scenario_llm import FLAT_ENTRY_PROMPT
-    # 2026-10-26: user-approved structural trend TP allocation; no preset weights.
+    # 2026-11-07: purpose-specific framing; host gates and TP allocation unchanged.
     expected = {
-        'SYSTEM_PROMPT': 'cff019b58e37e586932f3afb3cae4f78b984e10a3f34cf8a262f0d1e59cbeab5',
-        'MA_STRUCTURE_PROMPT': 'e133d909aaf1583ad364326732b3c7e8025b974ef87e7e18b4bd0ef9a78ab76f',
-        'FLAT_ENTRY_PROMPT': '901e83d231b213d78d182039ee0ecf0fd738e99af2525e609a309cf2042d0c25',
+        'SYSTEM_PROMPT': '7e9c462ad7c099be16e272ee11491f5e178f329a55cffddca287339eee9ef067',
+        'MA_STRUCTURE_PROMPT': '82859463405921af991331e9d9dde51bd5a72a5c0294feecea6f2b52af578615',
+        'FLAT_ENTRY_PROMPT': '93e1062f240495b0c476a35f561e21afddab054749d287a2d196121070e657c4',
     }
     for name, prompt in [('SYSTEM_PROMPT', SYSTEM_PROMPT), ('MA_STRUCTURE_PROMPT', MA_STRUCTURE_PROMPT),
                          ('FLAT_ENTRY_PROMPT', FLAT_ENTRY_PROMPT)]:
@@ -277,7 +277,7 @@ def test_management_framing_preserves_both_trend_runner_and_failure_responses():
     assert '30m/1h/4h/12h/1d/1w' in text
     assert 'Do not use 15m, including timing or management' in text
     assert 'five-minute evaluation cadence is not a candle timeframe' in text
-    assert 'favorable LONG or favorable SHORT deserves the same opportunity-cost review' in text
+    assert 'Supported trend continuation (LONG or SHORT)' in text
     assert 'neither early profit-taking nor a distant all-size TP is mandatory' in text
     assert 'Ordinary pullbacks with an intact primary thesis may justify WAIT' in text
     assert 'deterioration must inform management of EXISTING exposure' in text
@@ -565,6 +565,23 @@ def test_actual_model_payload_gets_same_primary_facts_as_request_record(monkeypa
     assert payload['contract_context']['current_primary_frame_facts'] == _current_primary_frame_facts(snapshot)
     assert payload['market_snapshot'] == analysis_model_view({'market_snapshot':snapshot})['market_snapshot']
     assert json.dumps([ctx, snapshot], sort_keys=True) == original
+
+
+def test_rejected_adjustment_is_exposed_as_not_applied_to_model(monkeypatch):
+    from live import scenario_recovery
+    from live.scenario_model_input import restore_model_input
+    ctx=context(True)
+    ctx['recent_actions']=[dict(action='ADJUST',revision=2,status='TERMINAL',
+                                verified_executed_quantity=0,action_applied=False,
+                                rejection_reason='target_evidence_unavailable')]
+    calls=[]
+    monkeypatch.setattr(scenario_recovery,'record_model_request',lambda **kw:None)
+    def generate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(text=json.dumps(exposure_proposal(ctx,'WAIT')))
+    propose({'valid':True,'as_of_ms':1000000},ctx,response_contract(ctx),generate=generate,clock=lambda:1000)
+    payload=restore_model_input(json.loads(calls[0]['user_prompt']))
+    assert payload['contract_context']['recent_actions']==ctx['recent_actions']
 
 
 @pytest.mark.parametrize('mode', ['flat', 'pending', 'holding'])

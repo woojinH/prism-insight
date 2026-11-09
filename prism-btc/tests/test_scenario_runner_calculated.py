@@ -1,3 +1,6 @@
+from utils.btc_review_references import read_tape
+from utils.btc_review_event_references import read_event
+from live.scenario_review_storage import review_text
 """Operational opt-in stays demo-only, durable, no-retry and default-off."""
 from copy import deepcopy
 import json
@@ -77,7 +80,7 @@ def test_operational_row_factory_records_real_review_without_legacy_fallback(tmp
 
     def generate(**request):
         requests.append(request)
-        assert (request['model'], request['reasoning_effort']) == ('gpt-6.1-sol', 'low')
+        assert (request['model'], request['reasoning_effort']) == ('gpt-6.1-terra', 'low')
         assert request["retry_transport"] is False
         assert 0 < request["timeout"] <= 75
         assert conn.execute("SELECT COUNT(*) FROM llm_scenario_review_events").fetchone()[0] > 0
@@ -103,7 +106,7 @@ def test_operational_row_factory_records_real_review_without_legacy_fallback(tmp
         assert outcome["status"] == ("blocked" if failure else "wait"), outcome
         assert len(requests) == 1
         assert broker.executed == []
-        envelope = json.loads(conn.execute("SELECT body FROM llm_scenario_review_tapes").fetchone()[0])
+        envelope = json.loads(read_tape(conn.execute("SELECT body FROM llm_scenario_review_tapes").fetchone()[0], conn, conn.execute("SELECT slot FROM llm_scenario_review_tapes").fetchone()[0], decode_legacy=review_text))
         assert envelope["outcome"]["status"] == ("FAILED" if failure else "COMPLETE")
         assert envelope["inputs"]["bindings"]["policy"] == runner.CALCULATED_REVIEW_MODE
         assert conn.execute("SELECT COUNT(*) FROM llm_scenario_intents").fetchone()[0] == 0
@@ -161,7 +164,7 @@ def test_operational_holding_row_factory_keeps_prices_and_exits(tmp_path, monkey
 
     def generate(**request):
         calls.append(request)
-        assert (request['model'], request['reasoning_effort']) == ('gpt-6.1-sol', 'low')
+        assert (request['model'], request['reasoning_effort']) == ('gpt-6.1-terra', 'low')
         assert request["retry_transport"] is False
         if "wait_proposal" in request["response_schema"]["properties"]:
             raw = wire(captured, "OPEN" if action == "ADJUST" else "EXIT")
@@ -262,7 +265,9 @@ def test_runner_first_observation_then_host_sized_decision_with_row_factory(tmp_
             submitted = broker.executed[0]
             assert submitted["entries"][0]["quantity"] > 0
             assert "allocation_fraction" not in submitted["entries"][0]
-            events = [json.loads(row[0]) for row in conn.execute("SELECT body FROM llm_scenario_review_events")]
+            events = [json.loads(read_event(body, conn, slot, sequence, decode_legacy=review_text))
+                      for slot, sequence, body in conn.execute(
+                          "SELECT slot,sequence,body FROM llm_scenario_review_events")]
             assert any(row["kind"] == "FINAL_FRESH_REVIEW_RECEIPT" for row in events)
             final = next(row for row in events if row["kind"] == "FINAL_FRESH_REVIEW_RECEIPT")
             assert final["stability_scope"] == "COHERENT_FINAL_OBSERVATION_EXECUTOR_FRESH_PREFLIGHT_REQUIRED"

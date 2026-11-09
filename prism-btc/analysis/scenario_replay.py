@@ -90,14 +90,56 @@ RUNTIME_EVENT_QUERIES = {
 
 
 def _runtime_event_hash(conn):
+    from live.scenario_review_storage import review_text
+    from utils.btc_review_event_references import read_event
+    from utils.btc_review_references import read_tape
+    from utils.btc_financial_references import restore as restore_financial
+    from utils.btc_audit_references import read_audit
+    from utils.btc_accounting_audit_references import read_accounting
+    from utils.btc_recovery_references import read_recovery
     event_tables = {}
     for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'llm_scenario%' ORDER BY name"):
         # Schema completeness is part of the hash contract, not optional coverage.
         if name not in RUNTIME_EVENT_QUERIES:
             raise TapeMismatch("unknown_runtime_event_table")
         cursor = conn.execute(RUNTIME_EVENT_QUERIES[name])
-        event_tables[name] = dict(columns=[field[0] for field in cursor.description],
-                                 rows=cursor.fetchall())
+        columns = [field[0] for field in cursor.description]
+        rows = cursor.fetchall()
+        if name == 'llm_scenario_decisions' and 'snapshot' in columns:
+            index = columns.index('snapshot')
+            rows = [tuple(review_text(value) if i == index and value is not None else value
+                          for i, value in enumerate(row)) for row in rows]
+        if name in ('llm_scenario_review_events', 'llm_scenario_review_tapes') and 'body' in columns:
+            index = columns.index('body')
+            slot_index = columns.index('slot')
+            sequence_index = columns.index('sequence') if name == 'llm_scenario_review_events' else None
+            rows = [tuple((read_tape(value, conn, row[slot_index], decode_legacy=review_text)
+                           if sequence_index is None else read_event(value, conn, row[slot_index], row[sequence_index],
+                                                                     decode_legacy=review_text)) if i == index else value
+                          for i, value in enumerate(row)) for row in rows]
+        if name == 'llm_scenario_recovery_events' and 'body' in columns:
+            index = columns.index('body')
+            slot_index = columns.index('slot') if 'slot' in columns else None
+            kind_index = columns.index('kind') if 'kind' in columns else None
+            rows = [tuple((read_recovery(value, conn, row[slot_index] if slot_index is not None else None,
+                                         decode_legacy=review_text,
+                                         expected_kind=row[kind_index] if kind_index is not None else None)
+                           if kind_index is None or row[kind_index] in ('MODEL_REQUEST', 'MODEL_RAW', 'INPUT') else review_text(value))
+                          if i == index else value
+                          for i, value in enumerate(row)) for row in rows]
+        if name == 'llm_scenario_broker_evidence' and {'body', 'kind'} <= set(columns):
+            index = columns.index('body')
+            kind_index = columns.index('kind')
+            rows = [tuple((restore_financial(value) if row[kind_index] == 'financial' else
+                           review_text(value) if row[kind_index] == 'account' else value) if i == index else value
+                          for i, value in enumerate(row)) for row in rows]
+        if name == 'llm_scenario_audit_events' and {'body', 'kind', 'decision_slot'} <= set(columns):
+            index, kind_index, slot_index = (columns.index(k) for k in ('body', 'kind', 'decision_slot'))
+            rows = [tuple((read_audit(value, conn, row[slot_index]) if row[kind_index] == 'decision_input'
+                           else read_accounting(value, conn) if row[kind_index] == 'accounting_observation' else value)
+                          if i == index else value
+                          for i, value in enumerate(row)) for row in rows]
+        event_tables[name] = dict(columns=columns, rows=rows)
     return digest(event_tables)
 
 
@@ -199,7 +241,7 @@ def contract_for(bundle,path,cost_multiplier,initial_equity,origin="luna",policy
                                  "flat":hashlib.sha256((SYSTEM_PROMPT+MA_STRUCTURE_PROMPT+FLAT_ENTRY_PROMPT).encode()).hexdigest()},
         request_audit="EXACT_ASSEMBLED_REQUEST_IN_TAPE_RAW_ENVELOPE;FIXTURE_EXPLICITLY_SYNTHETIC",
         start_ms=bundle["start_ms"],end_ms=bundle["end_ms"],path=path,initial_equity=initial_equity,
-        model=scenario_llm.MODEL,effort=scenario_llm.EFFORT,tier="fast",prompt_hash=hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest(),
+        model=scenario_llm.MODEL,effort=scenario_llm.EFFORT,tier="default",prompt_hash=hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest(),
         source_hashes=sources,runtime_versions={"python":sys.version.split()[0],"pandas":pd.__version__,"numpy":np.__version__},
         costs=dict(maker_fee=.0002*cost_multiplier,taker_fee=.00055*cost_multiplier,
                    slippage=.0005*cost_multiplier,spread=.0001,participation=.01),
@@ -351,7 +393,10 @@ class Driver:
 
 
 def _single_pass_audit_rows(conn, slot):
+    from live.scenario_review_storage import review_text
+    from utils.btc_recovery_references import read_recovery
     rows = conn.execute("SELECT kind,body FROM llm_scenario_recovery_events WHERE slot=? AND kind IN ('MODEL_REQUEST','MODEL_RAW') ORDER BY rowid", (slot,)).fetchall()
+    rows = [(kind, read_recovery(body, conn, slot, decode_legacy=review_text, expected_kind=kind)) for kind, body in rows]
     groups = {kind: [body for row_kind, body in rows if row_kind == kind]
               for kind in ('MODEL_REQUEST', 'MODEL_RAW')}
     if (any(len(group) > 1 for group in groups.values())
@@ -477,7 +522,10 @@ class Decisions:
 
 
 def run_replay(bundle,market,output,**kwargs):
-    with replay_identity_scope(economic=kwargs.get("policy_profile", "") in ECONOMIC_PROFILES,
+    if str(ROOT) not in sys.path:
+        sys.path.append(str(ROOT))
+    from observability.events import suppress_events
+    with suppress_events(), replay_identity_scope(economic=kwargs.get("policy_profile", "") in ECONOMIC_PROFILES,
                                stable_process_id=kwargs.get("policy_profile") == "economic-reject-goal-v2"):
         return _run_replay(bundle,market,output,**kwargs)
 
@@ -716,8 +764,11 @@ def _run_replay(bundle,market,output,*,mode,tape_path,path="OHLC",cost_multiplie
             if stopped:
                 report["readiness"]["insufficiency_reasons"].append("STOPPED_TECHNICAL_FAILURE")
         if policy_profile in REJECTION_PROFILES:
-            events = [(slot, json.loads(body)) for slot, body in conn.execute(
-                "SELECT slot,body FROM llm_scenario_review_events ORDER BY slot,sequence")]
+            from live.scenario_review_storage import review_text
+            from utils.btc_review_event_references import read_event
+            events = [(slot, json.loads(read_event(body, conn, slot, sequence, decode_legacy=review_text)))
+                      for slot, sequence, body in conn.execute(
+                "SELECT slot,sequence,body FROM llm_scenario_review_events ORDER BY slot,sequence")]
             rejected_slots = set()
             candidates = {}
             for slot, event in events:

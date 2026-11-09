@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from live.scenario_review_storage import review_text
+from utils.btc_review_event_references import read_event
 from live.scenario_entry_goal import (
     GoalConsistencyRejection, goal_schema, prepare_goal_source, resolve_goal, validate_goal_plan,
 )
@@ -79,6 +81,14 @@ def test_real_runtime_registers_original_source_and_renews_same_order(tmp_path, 
     active = r.state()['active']
     record = deepcopy(active['entry_contract'])
     assert record['version'] == 2 and 'expected_progress' not in record['definition']
+    assert r._entry_contract_registered(active)
+    from live.scenario_review_storage import review_storage, review_text
+    original_snapshot = r.conn.execute('SELECT snapshot FROM llm_scenario_decisions WHERE slot=?',
+                                       (record['resolved_goal']['decision_slot'],)).fetchone()[0]
+    assert isinstance(original_snapshot, bytes)
+    r.conn.execute('UPDATE llm_scenario_decisions SET snapshot=? WHERE slot=?',
+                   (review_storage(review_text(original_snapshot)), record['resolved_goal']['decision_slot']))
+    r.conn.commit()
     assert r._entry_contract_registered(active)
     original = deepcopy(b.children()[0]['request'])
     writes = deepcopy(e.writes)
@@ -597,7 +607,8 @@ def test_goal_source_loss_does_not_disable_registered_numeric_failure_exit(tmp_p
         elif damage == 'decision_missing':
             r.conn.execute('DELETE FROM llm_scenario_decisions WHERE slot=?', (slot,))
         else:
-            snap = json.loads(r.conn.execute('SELECT snapshot FROM llm_scenario_decisions WHERE slot=?', (slot,)).fetchone()[0])
+            from live.scenario_review_storage import review_text
+            snap = json.loads(review_text(r.conn.execute('SELECT snapshot FROM llm_scenario_decisions WHERE slot=?', (slot,)).fetchone()[0]))
             snap['timeframes']['4h']['ma_path']['confirmed_points'][0]['ma35'] += 1
             r.conn.execute('UPDATE llm_scenario_decisions SET snapshot=? WHERE slot=?', (json.dumps(snap), slot))
         r.conn.commit()
@@ -682,8 +693,9 @@ def test_host_link_preserves_fresh_economic_receipt_and_final_lease_hash(tmp_pat
     payload = json.loads(r.conn.execute('SELECT payload FROM llm_scenario_intents WHERE id=?',
         (record['origin']['action_id'],)).fetchone()[0])
     economic = {k: v for k, v in payload.items() if k != 'host_entry_contract_id'}
-    event = json.loads(r.conn.execute("SELECT body FROM llm_scenario_review_events "
-        "WHERE body LIKE '%FINAL_FRESH_REVIEW_RECEIPT%'").fetchone()[0])
+    events = (json.loads(read_event(body, r.conn, slot, sequence, decode_legacy=review_text))
+              for slot, sequence, body in r.conn.execute('SELECT slot,sequence,body FROM llm_scenario_review_events'))
+    event = next(item for item in events if item['kind'] == 'FINAL_FRESH_REVIEW_RECEIPT')
     assert receipt_hash(economic) == event['receipt']['validated_sha256']
     assert _digest(economic) == record['origin']['plan_sha256']
     assert receipt_hash(economic) != _digest(economic)  # Unicode vs ASCII JSON encoding is intentional.

@@ -414,6 +414,42 @@ REENTRY_V3_LIVE_MARKETS=KR,US      # 한 시장만 켜려면 KR 또는 US
   KR은 50일선 아래 신호가 평균 −1.0%로 약간 손해, US는 크게 이득. 한·미 같은 규칙으로 해제.
 - 끄기: `REENTRY_V3_DETERMINISTIC=false`(LLM 재점검 승인으로 복귀; `REENTRY_V3_LLM_RECHECK=true` 필요).
 
+### 11.6b 재진입 첫 비중 축소 (2026-11-08 사용자 결정)
+- 스위치: `REENTRY_V3_FIRST_SIZE_FACTOR`(코드 기본 1 = 변화 없음, 운영 0.5). 재진입 매수의 초분할 첫 비중을 B3 기본값 × 이 값으로 정한다
+  (`prism_core.micro_split_live.reentry_first_size`, 보유 행 `micro_split.reentry_size`에 기본·축소 값 기록). 상위 셋업 가중은 재진입에 붙지 않는다.
+  증액은 바꾸지 않는다: 매수 뒤 보유 재검토가 세우는 add_plan으로 한 슬롯까지 늘릴 수 있다.
+- 근거(H-1106-reentry-shrink, 감시 KR 129·US 672, sim2·E1): 첫 비중 반은 두 시장 v3 대비 통과(KR +25.2·US +232.7, 달 빼기 모두 플러스),
+  산 큰 종목·+25% 실현 수는 v3와 같다. 고른 게 아니라 손해 나는 재진입에 돈을 덜 쓴 몫이다. '반 + 오르면 추가'(4ways 4a·4b)는 추가분 승률 0~9%로
+  '반만'보다 못했다(수익 보호선이 추가 직후 판다). 보류 재진입 끄기는 큰 종목(SNDK·MRVL·NOW)을 잃어 하지 않았다(RESEARCH_LESSONS 11-08).
+- 주의: KR 고가주는 첫 비중이 1주 미만이면 실계좌 매수를 건너뛴다(기존 규칙). 축소로 이런 건이 늘 수 있다.
+
+### 11.6c 재진입 국면별 첫 비중 SHADOW (2026-11-09 사용자 승인, H-1109-kr-reentry-bull-size)
+- 스위치: `REENTRY_REGIME_SIZE_SHADOW`(기본 꺼짐). 켜면 재진입 매수 때 보유 행 `micro_split.reentry_regime_shadow`에
+  매수 시점 국면(`_deterministic_market_regime`)과 두 가상 첫 비중을 기록만 한다: `bull1_else0`(강세 B3×1, 횡보·약세 0),
+  `bull1_else05`(강세 B3×1, 횡보·약세 B3×0.5). 실제 주문 비중(`applied`)은 바꾸지 않는다. 국면이 없으면 `MISSING`, 가상 비중 없음.
+  기록 실패는 주문에 영향을 주지 않는다(`_safe_regime_shadow`).
+- 근거와 한계: RESEARCH_LESSONS 11-09 R6·R8~R10. 5년 재현 중앙값은 두 시장 모두 '강세 1·그 외 0'이 최고였지만
+  순서·표본 잡음 범위 안이라 오프라인으로 확정하지 못했다. 재측정: 2주 점검 때 등록일 이후 재진입을 국면별로 묶어
+  각 가상 비중 × 실현 수익률로 비교(횡보·약세에서 비중 0이면 그 슬롯이 다른 신규 매수에 쓰였을지는 별도 표기).
+- 끄기: 변수 제거 또는 1.
+
+### 11.6d 강세장 재진입 첫 비중 원래대로 LIVE (2026-11-09 사용자 결정, H-1109)
+- 스위치: `REENTRY_V3_BULL_FULL_SIZE`(기본 꺼짐). 켜면 재진입 매수 시점 국면이 강세(parabolic·strong_bull·moderate_bull)일 때
+  첫 비중을 B3 그대로(×1) 산다. 횡보·약세·국면 없음(MISSING)은 `REENTRY_V3_FIRST_SIZE_FACTOR`(현재 0.5) 그대로. KR·US 같음.
+  보유 행 `micro_split.reentry_size`에 `factor: "1"`, `reason: REENTRY_BULL_FULL_SIZE`, `regime`을 남긴다. 신규(정규) 매수는 영향 없음.
+- 근거와 한계: 5년 재진입 건별(R13, 2021~26) KR 강세 기대값 학습 +0.9%·검증 +6.5%(손익비 3.2·5.9), 횡보·약세는 두 기간 모두 마이너스.
+  US는 강세 검증 −0.7%로 근거 약함(횡보가 두 기간 플러스). 사용자가 한·미 같은 방향과 "현행 + 강세장 더 적극적"을 택했다.
+  계좌 재현 판정은 검출력 부족(R12)이라 근거로 쓰지 않는다.
+- 감시: 2주 점검마다 등록일 이후 재진입을 시장×국면으로 승률·평균 수익·평균 손실·손익비·+25% 이상으로 본다. US 강세 재진입이
+  20건 이상 쌓였는데 기대값이 마이너스면 US만 끄는 것을 사용자에게 묻는다.
+- 끄기: 변수 false 또는 제거(다음 재진입부터 절반으로 돌아감).
+- 나중 분석용 기록(오프라인 엔진을 실제 v3 신호에 맞추는 자료):
+  - 신호·근접 신호: `reentry_v3.shadow_trigger`·`shadow_near_miss` + 후보 원장 `mode=reentry_v3_signal|near_miss`
+    (지지선 기준, 스냅샷 10·20·50·200일선 값·거리·10봉 기울기, 50일선 상태, ATR, 60·252일 고점 거리, 거래량비, RS60).
+  - 결과: 주간 `candidate.forward_outcome`(5·10·20·30세션 최고·최저, 7·14·30일 수익) — 매수 안 한 신호도 포함.
+  - 실매수: `reentry_v3.live_entry`(신호·시도 횟수·손절·목표) + 새 포지션 `entry.executed`의 `micro_split`
+    (`reentry_size` 비중·사유·국면, `reentry_regime_shadow` 가상 비중) → `exit.executed`. 건너뜀은 `reentry_v3.live_skipped` 사유 코드.
+
 ### 11.7 첫 실거래일 점검표
 1. 14:00(한국)/13:50(미국) 실행 로그: 시세 수신 수, 신호 수, 재점검 결과(OK/승인 수), `live_results`.
 2. 매수 건: 저널 `submit`→`result` 한 쌍, 텔레그램 메시지의 재진입 문구, 보유 행 `trigger_type`이 "재진입(...)"인지.

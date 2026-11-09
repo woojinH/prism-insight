@@ -23,7 +23,7 @@ _REQUIRED_STABLE = (
     "accounting_status", "protection_ok", "legacy_fenced",
 )
 _OPTIONAL_STABLE = (
-    'entry_convergence', 'management_quarantine',
+    'entry_convergence', 'entry_economics', 'management_quarantine',
     'management_quarantine_block',
     "side", "scenario_risk_fraction", "seen_action_ids", "current_plan", "stop_policy",
     "execution_price_policy", "conditional_entry_version",
@@ -131,10 +131,12 @@ def guard_review(snapshot, original_context, response_contract, envelope, fresh_
             continue
         if (key in original) != (key in fresh) or original.get(key) != fresh.get(key):
             raise ValueError("review_guard_context_changed:" + key)
+    from live.scenario_management_quarantine import entry_aggregate_context
+    limited_entry_management = entry_aggregate_context(fresh, selected_plan['action'])
     if ((actionable and fresh["accounting_status"] != "confirmed")
             or fresh["accounting_status"] not in {"confirmed", "pending"}
             or fresh["protection_ok"] is not True
-            or fresh["legacy_fenced"] is not False
+            or (fresh["legacy_fenced"] is not False and not limited_entry_management)
             or type(fresh["new_risk_blocked"]) is not bool
             or ("recovery_hard_blocked" in fresh and type(fresh["recovery_hard_blocked"]) is not bool)):
         raise ValueError("review_guard_unsafe_lifecycle")
@@ -179,6 +181,12 @@ def guard_review(snapshot, original_context, response_contract, envelope, fresh_
             raise ValueError("review_guard_effective_plan_changed")
         if validated.get("risk") != expected.get("risk"):
             raise ValueError("review_guard_risk_changed")
+    if core['action'] == 'OPEN' and fresh.get('entry_economics') is not None:
+        from live.scenario_entry_economics import assess
+        from live.scenario_calculated_review import _gross_projection
+        economics = assess(validated, fresh, _gross_projection(validated, fresh))
+        if economics is None or economics['status'] != 'PASS':
+            raise ValueError('review_guard_entry_economics_changed')
     receipt = dict(status="FRESH_VALIDATED_NOT_AUTHORIZED", checked_at=now,
         envelope_sha256=envelope["sha256"], bundle_sha256=result["bundle_sha256"],
         selected_receipt_sha256=selected["receipt_sha256"],

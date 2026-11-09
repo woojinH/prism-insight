@@ -40,24 +40,35 @@ Unknown flags remain unknown: do not invent permission or a first-observation ba
 Choose strategic direction, entry,
 SL, TP, quantities and fractions yourself from supplied market evidence; the host
 does not choose these. Candidates are mutually exclusive alternatives, never a
-combined portfolio. Do not calculate reward/risk, costs or projected PnL yourself:
-the host will calculate your exact proposals for subsequent comparison. Do not
-shrink a structural SL to make size fit. A candidate may fail host risk validation;
-it will remain visible but cannot be selected. If no grounded candidate exists,
-return an empty candidates list and a qualitative
-reason identifying missing structure or evidence, not invented arithmetic.
-Economic objections alone must submit a candidate for host calculation, not use
-an empty list to bypass calculation. First recovery observation stays WAIT only,
-with empty candidates. Candidate submission is not an order or permission
-to trade. Unknown real fees never authorize invented net-reward arithmetic.
+combined portfolio. Compare the same thesis and original deadline; never force
+another candidate, opposite trade or duplicate plan.
+For fresh flat OPEN only, inspect entry_geometry cost share, SL/ATR, entry distance
+and original deadline. Missing stays unknown; rows do not recommend stops or
+prove support or fills. Choose structural invalidation with noise room before
+sizing. Neither a noise-thin SL nor a distant limit creates an edge by improving ratios.
+With strong 1h/30m progress and volume, compare grounded marketable continuation
+and pullback alternatives. Pullbacks need a reachable path within the deadline;
+a better price is not fill evidence. At reactions compare partial TP, protected
+runner and failure response. A level is not an automatic full-exit cap; extension
+needs evidence. Keep forming/confirmed facts distinct; never invent TP to fit.
+Do not calculate reward/risk, costs or projected PnL yourself: the host calculates
+exact effective plans for subsequent comparison. Unknown costs remain UNKNOWN.
+A candidate may fail host risk validation; it remains visible but cannot be selected.
+If no grounded structure exists, return no candidates and identify the missing
+qualitative evidence. Economic objections alone must submit a grounded candidate
+for host calculation instead of bypassing calculation with an empty list.
+First recovery observation stays WAIT only with no candidates. Submission is not
+an order or permission to trade; the original host expiry and gates still apply. Supplied entry_economics is a
+host eligibility constraint, never a reason to invent a distant TP or squeeze SL.
 For a new flat OPEN, consider TP, optional structural-weakening partial stops and
 remaining lots together. Noise alone need not justify partial SL; partial_stops=[]
 is valid when no structural reduction is grounded. Confirmed failure still means
 the existing full EXIT/protection rules, never partial-SL risk-budget credit.
 Cut invalidated exposure, not normal thesis-preserving fluctuations. Compare early
 TP concentration with participation in a sustained move: grounded later targets or
-SL-protected lots without fixed TP are allowed, never mandatory. Do not label
-rounding dust an intentional runner or invent a distant target to improve payoff.
+SL-protected residual lots are allowed subject to supplied entry_economics for new
+OPEN; holdings may retain unpriced targets. Never call rounding dust a runner
+or invent a distant target to improve payoff.
 Partial SL saves exposure on continued weakness but sacrifices lots on recovery;
 design that tradeoff before entry, without a fixed stop width or exit percentage.
 For an active scenario keep its side and original risk budget. ADJUST entries are
@@ -85,8 +96,14 @@ from the schema enum. Each host token binds a candidate ID (or WAIT) and its ful
 receipt hash; never construct a token or copy a separate hash field. Never rewrite
 prices, quantities, expiry or confidence; revised plans require a new research
 run, not an extra call here. Interpret trend, support/resistance, fill plausibility
-and supplied host calculations. Do not invent net profit or recompute supplied
-arithmetic. Risk reserves are NOT observed per-side fees or guaranteed losses.
+and supplied host calculations. Compare effective entry location, evidenced reaction
+zones, whole-path costs and grounded continuation; a higher conditional ratio alone
+is not a reason to select an implausible target. Keep the candidate's original
+purpose, direction and goal references; do not relabel it to obtain a favorable frame.
+Do not invent net profit or recompute supplied arithmetic. Confidence is not win
+probability; conditional target payoff is not expected return. Compare future risk
+and opportunity when holding, without using past losses to justify recovery bets.
+Risk reserves are NOT observed per-side fees or guaranteed losses.
 Read calculation_field_units for projection.targets fields: gross_pnl is the
 before-cost USDT amount for that target's quantity, not whole-scenario profit;
 gross_reward_per_btc is USDT/BTC price distance, never total USDT reward. Keep
@@ -101,7 +118,8 @@ new flat OPEN and confirmed remaining lots of a proposed ADJUST. Compare whole-p
 independent target profits. Flat paths assume full entry fills; active paths use
 only confirmed remaining lots. Both assume the displayed exit fills, not
 probabilities or expected net profit; partial SL is optional, never risk
-credit or a substitute for full EXIT on confirmed failure. No fixed payoff gate.
+credit or a substitute for full EXIT on confirmed failure. When entry_economics is supplied, the host enforces it before selection.
+Without that policy no fixed payoff gate is implied.
 Each path closes any remaining quantity at hard SL as a stress test, NOT the
 expected ending of a trend or the value of an open runner. Do not prefer liquidating upside simply because
 an assumed later hard-stop exit makes retained lots look costly. Separately assess
@@ -128,7 +146,8 @@ Flat OPEN whole_plan_payoff uses that all-TP-then-residual-hard-SL fee-only net_
 and full_stop_loss from full hard SL WITHOUT partial SL; both are USDT, ratio is
 dimensionless. UNKNOWN means missing costs/path or nonpositive loss denominator.
 This is a hypothetical payoff, not probability, expectancy or a guarantee; future
-funding/slippage are excluded, NOT zero. It changes no eligibility or risk budget.
+funding/slippage are excluded, NOT zero. The calculation does not change risk budgets; supplied entry_economics
+separately restricts fresh OPEN eligibility. Held protection remains available.
 ADJUST confirmed_remaining joint paths version3 are supplied separately as
 contract_context.holding_exit_paths rows [candidate_id,receipt_sha256,paths].
 This optional view uses the same row columns and
@@ -178,6 +197,72 @@ Return exactly selection_token and rationale, no other fields.
 def _encoded(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False,
                       separators=(",", ":"))
+
+
+def _flat_selection_prompt(system, context):
+    if ('scenario_id' not in context or context['scenario_id'] is not None
+            or context.get('positions') != [] or context.get('pending_entries') != []
+            or context.get('target_status') not in ([], {}) or context.get('unknown_intents') is not False
+            or context.get('legacy_fenced') is not False or context.get('protection_ok') is not True
+            or context.get('new_risk_blocked') is not False or context.get('accounting_status') != 'confirmed'):
+        return system
+    spans = (
+        ('When stop_policy.version=1 and widening_eligible=true, an ADJUST may request a\n',
+         'Partial SL remains conditional reduceOnly protection'),
+        ('Read current_plan, recent_actions and target_status before revising a scenario.\n',
+         'Distinguish order mechanics from evidence:'),
+        ('When an active scenario has confirmed filled exposure, re-evaluate whether its\n',
+         'On every OPEN, holding review and ADJUST,'),
+        ('On every holding review distinguish current holding advantage from merely NOT FAILED:\n',
+         'Use verified positions, pending entries and current accounting inputs,'),
+        ('ADJUST confirmed_remaining joint paths version3 are supplied separately as\n',
+         'Unknown actual future fees alone are not a new automatic WAIT gate;'),
+    )
+    intervals = []
+    for start, end in spans:
+        if system.count(start) != 1 or system.count(end) != 1:
+            return system
+        first, last = system.index(start), system.index(end)
+        if first >= last:
+            return system
+        intervals.append((first, last))
+    if any(a[1] > b[0] for a, b in zip(intervals, intervals[1:])):
+        return system
+    for first, last in reversed(intervals):
+        system = system[:first] + system[last:]
+    if type(context.get('recovery_contract_version')) is int and context['recovery_contract_version'] == 2:
+        start = 'When recovery_contract_version=1 and recovery.phase=OBSERVING, the three-loss\n'
+        end = 'A hard stop such as daily loss, unknown execution, bad data,'
+        legacy_intro = ('When recovery_contract_version=2, automatic staged normalization replaces the\n'
+                        'version-1 one-shot restrictions above. Closing')
+        if system.count(start) == system.count(end) == system.count(legacy_intro) == 1:
+            first, last = system.index(start), system.index(end)
+            if first < last:
+                system = system[:first] + system[last:]
+                system = system.replace(legacy_intro, 'When recovery_contract_version=2, closing', 1)
+    if (type(context.get('pending_wait_policy_version')) is int and context['pending_wait_policy_version'] == 1
+            and context.get('pending_renewal_version') is None
+            and context.get('pending_renewal_offer') is None):
+        spans = (
+            ('When pending_renewal_offer is supplied and the original registered entry thesis is\n',
+             'normal fill protection and original failure/EXIT rules always retain priority.\n'),
+            ('Judge current structure and costs, not mere desire to wait longer. Do not relabel\n',
+             'The host alone computes the offered deadline and refuses late or repeated renewal.\n'),
+        )
+        pending = []
+        for start, end in spans:
+            if system.count(start) != 1 or system.count(end) != 1:
+                return system
+            first, last = system.index(start), system.index(end)
+            if first >= last:
+                return system
+            if end.startswith('The host alone'):
+                last += len(end)
+            pending.append((first, last))
+        if pending[0][1] <= pending[1][0]:
+            for first, last in reversed(pending):
+                system = system[:first] + system[last:]
+    return system
 
 
 def receipt_hash(value):
@@ -554,16 +639,107 @@ def calculate_candidate(wire, context, *, candidate_id, original_input_now=None,
         if strict or context.get('entry_contract_version') == 2:
             raise
         receipt["rejection"] = "wire_economic_or_calculation_invalid"
+    if receipt.get('eligible') is True:
+        from live.scenario_entry_economics import assess
+        economics = assess(receipt['effective_plan'], context, receipt.get('projection', {}))
+        if economics is not None:
+            receipt['entry_economics'] = economics
+            if economics['status'] != 'PASS':
+                receipt.update(eligible=False, rejection_type='PREAUTHORITY_ECONOMIC',
+                    rejection='entry_payoff_below_minimum' if economics['status'] == 'REJECTED'
+                              else 'entry_payoff_unavailable')
     bind_receipt(receipt, context, snapshot=explanation_snapshot)
     receipt["receipt_sha256"] = receipt_hash(receipt)
     return receipt
 
 
+_ENTRY_PROGRESS_INPUT_LIMIT = 100_000
+
+
+def _initial_entry_progress_units(context):
+    """Initial entry-to-Mark geometry is neither portfolio PnL nor current risk."""
+    try:
+        evidence = context.get('entry_thesis')
+        positions = context.get('positions')
+        if (not context.get('scenario_id') or context.get('accounting_status') != 'confirmed'
+                or not isinstance(positions, list) or not positions
+                or any(not isinstance(p, dict) or _decimal(p.get('quantity')) <= 0 for p in positions)
+                or not isinstance(evidence, dict) or evidence.get('status') != 'VERIFIED'):
+            return None
+        side = evidence['side']
+        if side not in ('LONG', 'SHORT') or side != context.get('side'):
+            return None
+        average, stop, mark = (_decimal(evidence[k]) for k in ('initial_fill_average', 'initial_hard_stop', 'current_mark'))
+        now, observed, first, captured = (_decimal(v) for v in
+            (context['now'], evidence['observed_at'], evidence['first_fill_at'], context['account_captured_at']))
+        if (min(average, stop, mark, first) <= 0 or not first <= captured <= now
+                or not first <= observed <= now or now - captured > 120 or now - observed > 120
+                or abs(observed - captured) > Decimal('0.001') or mark != _decimal(context['mark_price'])):
+            return None
+        sign = Decimal(1) if side == 'LONG' else Decimal(-1)
+        distance = sign * (average - stop)
+        progress = sign * (mark - average)
+        if distance <= 0 or abs(progress - _decimal(evidence['favorable_price_change_from_initial_average'])) > Decimal('0.000001'):
+            return None
+        value = float(progress / distance)
+        if not math.isfinite(value):
+            return None
+        return dict(value=value, meaning='SIGNED_PRICE_PROGRESS_OVER_INITIAL_STOP_DISTANCE_NOT_PNL_OR_CURRENT_RISK',
+                    positive='FAVORABLE', negative='ADVERSE',
+                    scope='INITIAL_OPEN_ENDPOINT_ONLY_NOT_INTERVENING_PATH_OR_EXIT_RULE')
+    except (AttributeError, KeyError, TypeError, ValueError, ArithmeticError, OverflowError):
+        return None
+
+
+def _project_initial_entry_progress(projected, context):
+    """Add only if the original model input survives unchanged within its cap."""
+    value = _initial_entry_progress_units(context)
+    if value is None:
+        return projected
+    try:
+        from live.scenario_model_input import project_model_input, restore_model_input
+        if len(_encoded(projected).encode()) > _ENTRY_PROGRESS_INPUT_LIMIT:
+            return projected
+        original = restore_model_input(projected)
+        logical = deepcopy(original)
+        target = logical['contract_context']
+        if (target.get('scenario_id') != context.get('scenario_id')
+                or target.get('entry_thesis') != context.get('entry_thesis')
+                or target.get('mark_price') != context.get('mark_price')
+                or target.get('positions') != context.get('positions')
+                or target.get('accounting_status') != context.get('accounting_status')
+                or target.get('account_captured_at') != context.get('account_captured_at')
+                or 'initial_entry_progress_units' in target):
+            return projected
+        target['initial_entry_progress_units'] = value
+        candidate, _ = project_model_input(logical, allow_gap_rescue=True)
+        if len(_encoded(candidate).encode()) > _ENTRY_PROGRESS_INPUT_LIMIT:
+            return projected
+        restored = restore_model_input(candidate)
+        restored['contract_context'].pop('initial_entry_progress_units', None)
+        return candidate if restored == original else projected
+    except (KeyError, TypeError, ValueError, ArithmeticError, OverflowError):
+        return projected
+
+
 def _model_payload(snapshot, context, response_contract, *, calculated_candidates=None):
-    baseline = _base_model_payload(snapshot, context, response_contract, calculated_candidates=calculated_candidates)
-    if not explanation_enabled(context):
-        baseline = project_holding_price_order_input(baseline)[0]
-    return project_explanation_input(baseline, context, snapshot=snapshot)
+    def project(source):
+        baseline = _base_model_payload(source, context, response_contract, calculated_candidates=calculated_candidates)
+        if not explanation_enabled(context):
+            baseline = project_holding_price_order_input(baseline)[0]
+        projected = project_explanation_input(baseline, context, snapshot=source)
+        if calculated_candidates is None and context.get('scenario_id') is None:
+            from live.scenario_entry_geometry import project as project_entry_geometry
+            projected = project_entry_geometry(projected, source, context)
+        return _project_initial_entry_progress(projected, context)
+    result = project(snapshot)
+    frame = snapshot.get('timeframes', {}).get('30m', {})
+    if (context.get('scenario_id') is None and not context.get('positions')
+            and 'volume_4d_30m' in frame and len(_encoded(result).encode()) > 100_000):
+        fallback = deepcopy(snapshot)
+        fallback['timeframes']['30m'].pop('volume_4d_30m')
+        return project(fallback)
+    return result
 
 
 def _base_model_payload(snapshot, context, response_contract, *, calculated_candidates=None):
@@ -716,9 +892,12 @@ def calculate_economic_candidate(raw, context, *, candidate_id, original_input_n
     )
     if not model_matches(raw, {"anyOf": _action_allocation_branches(context)["anyOf"]}, context):
         raise ValueError("research_allocation_contract")
+    from live.scenario_management_quarantine import entry_aggregate_context
+    limited_entry_management = entry_aggregate_context(context, raw['action'])
     if (context.get("accounting_status") not in {"confirmed", "pending"}
             or (raw["action"] in {"OPEN", "ADJUST"} and context["accounting_status"] != "confirmed")
-            or context.get("protection_ok") is not True or context.get("legacy_fenced") is not False
+            or context.get("protection_ok") is not True
+            or (context.get("legacy_fenced") is not False and not limited_entry_management)
             or type(context.get("new_risk_blocked")) is not bool):
         raise ValueError("research_unsafe_economic_context")
     mark = _number(context.get("mark_price"), "mark_price", positive=True)
@@ -937,9 +1116,11 @@ def research_review(snapshot, context, response_contract, *, generate, record,
         system = scenario_llm.immediate_reduce_instructions(base + appendix, frozen_context)
         if explanation_enabled(frozen_context):
             system += EXPLANATION_PROMPT
+        if phase == 'selection':
+            system = _flat_selection_prompt(system, frozen_context)
         request = dict(system_prompt=system, user_prompt=prompt,
             model=scenario_llm.MODEL, reasoning_effort=scenario_llm.EFFORT,
-            fast_tier=True, timeout=scenario_llm.TIMEOUT_SECONDS - (now - started),
+            fast_tier=False, timeout=scenario_llm.TIMEOUT_SECONDS - (now - started),
             mcp_profile=None, response_schema=output_schema, retry_transport=False)
         request_hash = receipt_hash(request)
         record(deepcopy(dict(kind="MODEL_REQUEST", phase=phase, request=request,

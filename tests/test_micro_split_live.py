@@ -562,8 +562,10 @@ def test_batch_entries_pass_the_trigger_and_reentry_passes_none(path):
              and isinstance(node.func.value, ast.Name) and node.func.value.id == "micro_split_live"]
     assert len(calls) == 1
     value = next(k.value for k in calls[0].keywords if k.arg == "trigger_type")
-    assert isinstance(value, ast.IfExp) and isinstance(value.test, ast.Name)
-    assert value.test.id == "require_micro_plan" and isinstance(value.body, ast.Constant) and value.body.value is None
+    assert isinstance(value, ast.IfExp) and isinstance(value.body, ast.Constant) and value.body.value is None
+    # 2026-11-08: micro-split pyramid rows (PYRAMID_ROWS_MICRO_SPLIT_ENABLED) get no tilt either.
+    assert isinstance(value.test, ast.BoolOp) and isinstance(value.test.op, ast.Or)
+    assert [n.id for n in value.test.values] == ["require_micro_plan", "pyramid_row"]
 
 
 def test_buy_prompt_never_mentions_the_tilt(live_on, monkeypatch):
@@ -588,3 +590,107 @@ def test_untilted_buy_plan_is_not_rebased(live_on):
     _, _, scenario = _tilted(trigger=None, add_plan=raw)
     stored = scenario["micro_split"]["add_plan"]
     assert "rebased" not in stored and [s["target_allocation"] for s in stored["scenarios"]] == ["0.55", "0.60"]
+
+
+def _reentry_prepared(factor, monkeypatch, *, trigger_type=None, buy_score=None, regime=None):
+    if factor is None:
+        monkeypatch.delenv("REENTRY_V3_FIRST_SIZE_FACTOR", raising=False)
+    else:
+        monkeypatch.setenv("REENTRY_V3_FIRST_SIZE_FACTOR", factor)
+    scenario = {"stop_loss": 9300, "reentry": {"version": "reentry_v3"}}
+    if regime is not None:
+        scenario["_deterministic_market_regime"] = regime
+    if buy_score is not None:
+        scenario["buy_score"] = buy_score
+    return live.prepare_entry(_agent(), market="KR", ticker="005930", current_price=10000, scenario=scenario,
+                              decision_ref="reentry_v3:x", account={"buy_amount_krw": 1_000_000},
+                              trigger_type=trigger_type)
+
+
+def test_reentry_first_size_halves_the_b3_initial(live_on, monkeypatch):
+    plan, cash, scenario = _reentry_prepared("0.5", monkeypatch)
+    block = scenario["micro_split"]
+    assert plan["initial_nominal"] == "0.7777"
+    assert block["allocation"] == block["legs"][0]["allocation"] == "0.3888" and cash == 388_800
+    assert block["reentry_size"] == {"base": "0.7777", "sized": "0.3888", "factor": "0.5",
+                                     "reason": live.REENTRY_SIZE_REASON}
+    assert "재진입 첫 비중 축소, 기본 78%에서 하향" in live.entry_message_block(scenario, "KR")[0]
+
+
+@pytest.mark.parametrize("factor", [None, "1", "0", "1.5", "abc"])
+def test_reentry_first_size_off_or_invalid_keeps_b3(live_on, monkeypatch, factor):
+    _, cash, scenario = _reentry_prepared(factor, monkeypatch)
+    assert scenario["micro_split"]["allocation"] == "0.7777" and cash == 777_700
+    assert "reentry_size" not in scenario["micro_split"]
+
+
+def test_regular_entry_ignores_the_reentry_factor(live_on, monkeypatch):
+    monkeypatch.setenv("REENTRY_V3_FIRST_SIZE_FACTOR", "0.5")
+    _, cash, scenario = _prepared()
+    assert scenario["micro_split"]["allocation"] == "0.7777" and "reentry_size" not in scenario["micro_split"]
+
+
+@pytest.mark.parametrize("regime,bucket,else0,else05", [("strong_bull", "bull", "0.7777", "0.7777"),
+                                                         ("sideways", "sideways", "0", "0.3888"),
+                                                         ("moderate_bear", "bear", "0", "0.3888")])
+def test_regime_size_shadow_records_arms_without_changing_the_order(live_on, monkeypatch, regime, bucket, else0, else05):
+    monkeypatch.setenv("REENTRY_REGIME_SIZE_SHADOW", "true")
+    _, cash, scenario = _reentry_prepared("0.5", monkeypatch, regime=regime)
+    block = scenario["micro_split"]
+    assert block["allocation"] == "0.3888" and cash == 388_800          # the order keeps the live 0.5 factor
+    shadow = block["reentry_regime_shadow"]
+    assert shadow["bucket"] == bucket and shadow["applied"] == "0.3888" and shadow["applied_factor"] == "0.5"
+    assert shadow["arms"]["bull1_else0"]["sized"] == else0 and shadow["arms"]["bull1_else05"]["sized"] == else05
+
+
+def test_regime_size_shadow_missing_regime_and_off(live_on, monkeypatch):
+    monkeypatch.setenv("REENTRY_REGIME_SIZE_SHADOW", "true")
+    _, _, scenario = _reentry_prepared("0.5", monkeypatch)
+    shadow = scenario["micro_split"]["reentry_regime_shadow"]
+    assert shadow["bucket"] == "MISSING" and "arms" not in shadow
+    monkeypatch.delenv("REENTRY_REGIME_SIZE_SHADOW")
+    _, _, scenario = _reentry_prepared("0.5", monkeypatch, regime="strong_bull")
+    assert "reentry_regime_shadow" not in scenario["micro_split"]
+
+
+def test_regime_size_shadow_ignores_regular_entries(live_on, monkeypatch):
+    monkeypatch.setenv("REENTRY_REGIME_SIZE_SHADOW", "true")
+    _, _, scenario = _prepared()
+    assert "reentry_regime_shadow" not in scenario["micro_split"]
+
+
+def test_regime_size_shadow_failure_keeps_the_live_entry(live_on, monkeypatch):
+    monkeypatch.setenv("REENTRY_REGIME_SIZE_SHADOW", "true")
+    monkeypatch.setattr(live, "regime_size_shadow", lambda *a, **k: 1 / 0)
+    _, cash, scenario = _reentry_prepared("0.5", monkeypatch, regime="strong_bull")
+    assert scenario["micro_split"]["allocation"] == "0.3888" and cash == 388_800
+    assert "reentry_regime_shadow" not in scenario["micro_split"]
+
+
+@pytest.mark.parametrize("regime,cash,factor", [("strong_bull", 777_700, "1"), ("moderate_bull", 777_700, "1"),
+                                                ("parabolic", 777_700, "1"), ("sideways", 388_800, "0.5"),
+                                                ("strong_bear", 388_800, "0.5"), (None, 388_800, "0.5")])
+def test_reentry_bull_full_size_only_in_bull(live_on, monkeypatch, regime, cash, factor):
+    monkeypatch.setenv("REENTRY_V3_BULL_FULL_SIZE", "true")
+    monkeypatch.setenv("REENTRY_REGIME_SIZE_SHADOW", "true")
+    _, got, scenario = _reentry_prepared("0.5", monkeypatch, regime=regime)
+    block = scenario["micro_split"]
+    assert got == cash and block["reentry_size"]["factor"] == factor
+    assert block["reentry_regime_shadow"]["applied_factor"] == factor
+    msg = live.entry_message_block(scenario, "KR")[0]
+    assert ("재진입 첫 비중 축소" in msg) == (factor == "0.5")
+    if factor == "1":
+        assert block["reentry_size"]["reason"] == live.REENTRY_BULL_SIZE_REASON and block["allocation"] == "0.7777"
+
+
+def test_reentry_bull_full_size_off_keeps_half(live_on, monkeypatch):
+    monkeypatch.delenv("REENTRY_V3_BULL_FULL_SIZE", raising=False)
+    _, cash, scenario = _reentry_prepared("0.5", monkeypatch, regime="strong_bull")
+    assert cash == 388_800 and scenario["micro_split"]["reentry_size"]["factor"] == "0.5"
+
+
+def test_regular_entry_ignores_the_bull_full_size(live_on, monkeypatch):
+    monkeypatch.setenv("REENTRY_V3_BULL_FULL_SIZE", "true")
+    monkeypatch.setenv("REENTRY_V3_FIRST_SIZE_FACTOR", "0.5")
+    _, cash, scenario = _prepared()
+    assert cash == 777_700 and "reentry_size" not in scenario["micro_split"]
