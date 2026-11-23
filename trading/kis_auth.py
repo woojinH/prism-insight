@@ -3,6 +3,7 @@
 # ====|  Includes common API call functions                                  |=====================
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
@@ -16,7 +17,7 @@ import warnings
 from base64 import b64decode
 from collections import namedtuple
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 import stat
 import hashlib
@@ -825,6 +826,72 @@ class CrossPlatformFileLock:
         self.release()
 
 
+# ============== Shared token store (invest-hub) ==============
+# One token per (server, app key) shared by every invest-hub program: the engine runs under several
+# KIS_CONFIG_ROOTs (engine config, per-account configs) and invest-hub's own services use the same app keys.
+# KIS sends a text message on every issuance and allows one issuance per minute, so separate caches meant
+# several messages a day for one key. Same folder, file format and lock protocol as
+# invest-hub services/common/kis_token_store.py. Disabled when neither env var is set.
+SHARED_TOKEN_MARGIN_SEC = 600
+_KST = timezone(timedelta(hours=9))
+
+
+def _shared_token_dir() -> Optional[Path]:
+    d = os.environ.get("KIS_SHARED_TOKEN_DIR")
+    if d:
+        return Path(d)
+    home = os.environ.get("INVEST_HUB_HOME")
+    return Path(home) / "kis-tokens" if home else None
+
+
+def _shared_token_path(d: Path, base: str, app_key: str) -> Path:
+    name = hashlib.sha256(f"{str(base).rstrip('/')}|{app_key}".encode()).hexdigest()[:24]
+    return Path(d) / f"{name}.json"
+
+
+def read_shared_token(base: str, app_key: str) -> Optional[str]:
+    d = _shared_token_dir()
+    if d is None or not base or not app_key:
+        return None
+    try:
+        t = json.loads(_shared_token_path(d, base, app_key).read_text())
+        until = datetime.fromisoformat(t["until"])
+        if (until.tzinfo is not None and t.get("base") == str(base).rstrip("/") and t.get("token")
+                and until > datetime.now(timezone.utc) + timedelta(seconds=SHARED_TOKEN_MARGIN_SEC)):
+            logging.info("✅ Using shared token")
+            return str(t["token"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def save_shared_token(base: str, app_key: str, my_token: str, my_expired: str) -> None:
+    """my_expired: KIS access_token_token_expired ("YYYY-MM-DD HH:MM:SS", KST). Failure is logged, never raised."""
+    d = _shared_token_dir()
+    if d is None:
+        return
+    try:
+        until = datetime.strptime(my_expired, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_KST)
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        f = _shared_token_path(d, base, app_key)
+        tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"token": my_token, "until": until.astimezone(timezone.utc).isoformat(),
+                       "base": str(base).rstrip("/")}, fh)
+        os.replace(tmp, f)
+    except Exception as e:
+        logging.warning(f"Could not save shared token: {type(e).__name__}")
+
+
+def _shared_issue_lock():
+    d = _shared_token_dir()
+    if d is None:
+        return contextlib.nullcontext()
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return CrossPlatformFileLock(str(d / ".issue.lock"), timeout=60)
+
+
 # ============== Retry Logic for Token Request ==============
 @retry(
     stop=stop_after_attempt(3),
@@ -1118,14 +1185,16 @@ def auth(
     p["appkey"] = app_key
     p["appsecret"] = app_secret
 
-    # Check for existing valid token (per-account if account_key provided)
-    saved_token = read_token(account_key=account_key)
+    # Check for existing valid token: the shared store first (same app key used elsewhere), then
+    # this config root's own file (per-account if account_key provided)
+    token_base = _cfg.get(svr)
+    saved_token = read_shared_token(token_base, app_key) or read_token(account_key=account_key)
 
     if saved_token is None:
         # KIS allows one token issue per minute (EGW00133): serialize issuance across processes and
         # re-read, since a concurrent job (e.g. news titles at the same cron minute) may have just saved one.
-        with CrossPlatformFileLock(os.path.join(config_root, ".token_issue.lock"), timeout=60):
-            saved_token = read_token(account_key=account_key)
+        with CrossPlatformFileLock(os.path.join(config_root, ".token_issue.lock"), timeout=60), _shared_issue_lock():
+            saved_token = read_shared_token(token_base, app_key) or read_token(account_key=account_key)
             if saved_token is None:
                 # No valid token - request new one
                 token_url = f"{_cfg[svr]}/oauth2/tokenP"
@@ -1147,6 +1216,7 @@ def auth(
 
                     # Save the new token (per-account if account_key provided)
                     save_token(my_token, my_expired, account_key=account_key)
+                    save_shared_token(token_base, app_key, my_token, my_expired)
                     logging.info(f"✅ New token obtained and saved (expires: {my_expired})")
 
                 except TokenRequestError as e:

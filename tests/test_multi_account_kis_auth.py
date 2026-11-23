@@ -266,3 +266,67 @@ def test_auth_rereads_token_under_issue_lock_before_requesting(monkeypatch, tmp_
 
     assert seen["token"] == "token-saved-by-peer"
     assert not (tmp_path / ".token_issue.lock").exists()
+
+
+def _shared_cfg(monkeypatch, tmp_path):
+    cfg = {**_base_cfg(), "my_app": "PSREALKEY", "my_sec": "real-secret", "prod": "https://example.com/"}
+    _patch_cfg(monkeypatch, cfg)
+    monkeypatch.setattr(ka, "config_root", str(tmp_path / "root"))
+    (tmp_path / "root").mkdir()
+    monkeypatch.delenv("INVEST_HUB_HOME", raising=False)
+    monkeypatch.setenv("KIS_SHARED_TOKEN_DIR", str(tmp_path / "shared"))
+    monkeypatch.setattr(ka, "validate_credentials", lambda *a, **k: (True, ""))
+    seen = {}
+    monkeypatch.setattr(ka, "changeTREnv", lambda token, *a, **k: seen.setdefault("token", token))
+    return seen
+
+
+def test_auth_uses_shared_token_from_other_programs(monkeypatch, tmp_path):
+    # 2026-11-23: invest-hub programs held the same app key in separate caches; KIS texts on every issue.
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    seen = _shared_cfg(monkeypatch, tmp_path)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    until = (datetime.now(timezone.utc) + timedelta(hours=20)).isoformat()
+    ka._shared_token_path(shared, "https://example.com", "PSREALKEY").write_text(
+        json.dumps({"token": "shared-token", "until": until, "base": "https://example.com"}))
+    monkeypatch.setattr(ka, "read_token", lambda account_key=None: None)
+    monkeypatch.setattr(ka, "_request_token_with_retry", lambda *a, **k: pytest.fail("must reuse the shared token"))
+
+    ka.auth(svr="prod")
+
+    assert seen["token"] == "shared-token"
+
+
+def test_auth_saves_new_token_to_shared_store(monkeypatch, tmp_path):
+    import json
+    from datetime import datetime, timezone
+
+    seen = _shared_cfg(monkeypatch, tmp_path)
+    monkeypatch.setattr(ka, "read_token", lambda account_key=None: None)
+    saved = []
+    monkeypatch.setattr(ka, "save_token", lambda *a, **k: saved.append(a))
+    monkeypatch.setattr(ka, "_request_token_with_retry", lambda *a, **k: {
+        "access_token": "new-token", "access_token_token_expired": "2099-11-24 16:10:26"})
+
+    ka.auth(svr="prod")
+
+    assert seen["token"] == "new-token" and saved
+    f = ka._shared_token_path(tmp_path / "shared", "https://example.com", "PSREALKEY")
+    data = json.loads(f.read_text())
+    assert data["token"] == "new-token" and data["base"] == "https://example.com"
+    assert datetime.fromisoformat(data["until"]) == datetime(2099, 11, 24, 7, 10, 26, tzinfo=timezone.utc)  # KST to UTC
+    assert oct(f.stat().st_mode & 0o777) == "0o600"
+    assert ka.read_shared_token("https://example.com", "PSREALKEY") == "new-token"
+    assert ka.read_shared_token("https://example.com", "OTHERKEY") is None
+    assert not (tmp_path / "shared" / ".issue.lock").exists()
+
+
+def test_shared_store_off_without_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("INVEST_HUB_HOME", raising=False)
+    monkeypatch.delenv("KIS_SHARED_TOKEN_DIR", raising=False)
+    assert ka._shared_token_dir() is None
+    assert ka.read_shared_token("https://example.com", "PSREALKEY") is None
+    ka.save_shared_token("https://example.com", "PSREALKEY", "t", "2099-01-01 00:00:00")  # no-op, no error
